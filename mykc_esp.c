@@ -15,6 +15,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/slab.h>
+#include <linux/vmalloc.h>
 #include <linux/timer.h>
 #include <linux/workqueue.h>
 #include <linux/ktime.h>
@@ -61,7 +62,7 @@ static u32 isqrt64(u64 v)
 /* GKI 内核允许浮点: 用整数近似 sin/cos（避免依赖 libm）*/
 static s32 fix_sin(u32 deg)
 {
-    static const u16 sin_tab[91] = {
+    static const u32 sin_tab[91] = {
           0,  1144,  2287,  3430,  4571,  5712,  6850,  7987,
        9121, 10252, 11380, 12505, 13626, 14742, 15855, 16962,
       18064, 19161, 20252, 21336, 22415, 23486, 24550, 25607,
