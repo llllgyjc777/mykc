@@ -14,33 +14,18 @@ jobs:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 安装编译依赖
+      - name: 安装编译依赖 + 交叉工具链
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev kmod \
-            zip unzip python3 git make wget curl cpio xz-utils
+            zip unzip python3 git make wget curl cpio xz-utils \
+            clang lld llvm gcc-aarch64-linux-gnu
+          # Ubuntu 自带 clang 版本
+          clang --version | head -2
+          ld.lld --version | head -1
+          aarch64-linux-gnu-gcc --version | head -1
+          echo "CLANG_BIN=$(which clang)" >> $GITHUB_ENV
           echo "=== 内存 ==="; free -h
-
-      # ============================================================
-      # 用 GitHub 上现成的 GKI 预编译产物（别人已经编好的 KMI 包）
-      # 这是目前最可靠的路线: 不 clone 大仓库, 直接下 tar
-      # ============================================================
-
-      - name: 下载 Android clang 工具链 (tarball 直链)
-        run: |
-          mkdir -p $HOME/tc && cd $HOME/tc
-          echo "下载 clang-r510928 (Android 15 官方工具链)..."
-          # 官方直链, 约 600MB
-          url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r510928.tar.gz"
-          wget -q --tries=3 --timeout=60 -O clang.tar.gz "$url" || {
-            echo "直链失败, 尝试 2..."
-            wget -q --tries=3 -O clang.tar.gz \
-              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/master/clang-r510928.tar.gz"
-          }
-          mkdir -p clang-tc && tar -xzf clang.tar.gz -C clang-tc 2>&1 | tail -3
-          CLANG=$HOME/tc/clang-tc/bin/clang
-          echo "CLANG_BIN=$CLANG" >> $GITHUB_ENV
-          $CLANG --version | head -2 || echo "clang 提取失败"
 
       - name: 下载 GKI 内核源码 (tarball 直链, 不 clone)
         run: |
