@@ -21,6 +21,7 @@
 #include <linux/kernel.h>
 #include <linux/init.h>
 #include <linux/fs.h>
+#include <linux/file.h>          /* fput / fd_install / get_unused_fd_flags */
 #include <linux/miscdevice.h>
 #include <linux/uaccess.h>
 #include <linux/sched.h>
@@ -40,6 +41,7 @@
 #include <linux/seq_file.h>
 #include <linux/mm_types.h>
 #include <linux/ktime.h>
+#include <linux/mman.h>          /* vm_flags_set */
 #include <asm/pgtable.h>
 #include <asm/memory.h>
 #include <asm/page.h>
@@ -294,7 +296,7 @@ static struct page *g_ring_page;
 static int mykc_ring_mmap(struct file *filp, struct vm_area_struct *vma)
 {
     if (!g_ring_page) return -ENOMEM;
-    vma->vm_flags |= VM_DONTEXPAND | VM_DONTDUMP;
+    vm_flags_set(vma, VM_DONTEXPAND | VM_DONTDUMP);
     return remap_pfn_range(vma, vma->vm_start,
                            page_to_pfn(g_ring_page),
                            PAGE_SIZE, vma->vm_page_prot);
@@ -625,7 +627,7 @@ static int __init mykc_init(void)
 static void __exit mykc_exit(void)
 {
     mykc_esp_exit();
-    misc_unregister(&mykc_dev);
+    misc_deregister(&mykc_dev);
     if (g_ring_page) __free_page(g_ring_page);
     kfree(g_hide_pid_map);
     vfree(g_pte_cache);
