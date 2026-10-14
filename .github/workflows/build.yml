@@ -18,95 +18,88 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev kmod \
-            zip unzip python3 git make wget curl cpio
-          echo "=== 磁盘 ==="; df -h /
+            zip unzip python3 git make wget curl cpio xz-utils
           echo "=== 内存 ==="; free -h
 
-      - name: 下载 Android clang 工具链
+      # ============================================================
+      # 用 GitHub 上现成的 GKI 预编译产物（别人已经编好的 KMI 包）
+      # 这是目前最可靠的路线: 不 clone 大仓库, 直接下 tar
+      # ============================================================
+
+      - name: 下载 Android clang 工具链 (tarball 直链)
         run: |
           mkdir -p $HOME/tc && cd $HOME/tc
-          echo "下载 prebuilt clang..."
-          git clone --depth 1 \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-            clang-tc 2>&1 | tail -3
-          CLANG=$(ls $HOME/tc/clang-tc/clang-r*/bin/clang 2>/dev/null | sort | tail -1)
-          if [ -z "$CLANG" ]; then
-            CLANG=$(find $HOME/tc/clang-tc -name clang -type f -path '*bin*' | head -1)
-          fi
+          echo "下载 clang-r510928 (Android 15 官方工具链)..."
+          # 官方直链, 约 600MB
+          url="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r510928.tar.gz"
+          wget -q --tries=3 --timeout=60 -O clang.tar.gz "$url" || {
+            echo "直链失败, 尝试 2..."
+            wget -q --tries=3 -O clang.tar.gz \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/master/clang-r510928.tar.gz"
+          }
+          mkdir -p clang-tc && tar -xzf clang.tar.gz -C clang-tc 2>&1 | tail -3
+          CLANG=$HOME/tc/clang-tc/bin/clang
           echo "CLANG_BIN=$CLANG" >> $GITHUB_ENV
-          echo "clang = $CLANG"
-          $CLANG --version | head -2
+          $CLANG --version | head -2 || echo "clang 提取失败"
 
-      - name: 下载 GKI 预编译内核产物 (KMI android15-6.6)
+      - name: 下载 GKI 内核源码 (tarball 直链, 不 clone)
         run: |
           cd $HOME
-          # 官方 GKI 预编译: 含 vmlinux + Module.symvers + headers，不用编内核
-          echo "尝试下载 GKI 预编译包..."
-          mkdir -p gki && cd gki
-
-          # 方式: 从 kernel/common 分支直接拉构建产物
-          # Google 提供 prebuilt KMI 在 android.googlesource.com 的特定 tag
-          git clone --depth 1 -b android15-6.6 \
-            https://android.googlesource.com/kernel/common \
-            common 2>&1 | tail -3
-
-          cd common
-          echo "=== 检查是否含 Module.symvers ==="
-          ls -la Module.symvers 2>/dev/null || echo "无 Module.symvers(正常,浅克隆)"
-
+          mkdir -p common && cd common
+          echo "下载 kernel/common android15-6.6 tarball..."
+          url="https://android.googlesource.com/kernel/common/+archive/refs/heads/android15-6.6.tar.gz"
+          wget -q --tries=3 --timeout=120 -O k.tar.gz "$url" || {
+            echo "尝试 github 镜像..."
+            wget -q --tries=3 -O k.tar.gz \
+              "https://github.com/aosp-mirror/kernel_common/archive/refs/heads/android15-6.6.tar.gz"
+            tar -xzf k.tar.gz --strip-components=1
+          }
+          if [ -f k.tar.gz ]; then tar -xzf k.tar.gz 2>&1 | tail -3; fi
+          echo "=== 解压后文件数 ==="
+          ls | wc -l
           echo "=== 内核版本 ==="
-          head -5 Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL'
+          grep -E '^VERSION|^PATCHLEVEL|^SUBLEVEL' Makefile 2>/dev/null | head -3
+          echo "KERNEL_DIR=$HOME/common" >> $GITHUB_ENV
 
-          echo "KERNEL_DIR=$HOME/gki/common" >> $GITHUB_ENV
-
-      - name: 生成模块构建环境 (不需要编整个内核)
+      - name: 生成模块构建环境
         run: |
           cd ${{ env.KERNEL_DIR }}
           CLANG=${{ env.CLANG_BIN }}
-
-          echo "=== 用 gki_defconfig 生成 .config ==="
-          make ARCH=arm64 CC=$CLANG LLVM=1 gki_defconfig 2>&1 | tail -5
-
-          # 关键: 允许未签名模块
+          export PATH=$(dirname $CLANG):$PATH
+          echo "=== gki_defconfig ==="
+          make ARCH=arm64 LLVM=1 gki_defconfig 2>&1 | tail -5
           ./scripts/config --file .config -d MODULE_SIG_FORCE 2>/dev/null || true
-          ./scripts/config --file .config -e MODULE_SIG 2>/dev/null || true
-          make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -3
-
-          echo "=== modules_prepare (生成头文件 + 符号表) ==="
-          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 modules_prepare 2>&1 | tail -15
+          make ARCH=arm64 LLVM=1 olddefconfig 2>&1 | tail -3
+          echo "=== modules_prepare ==="
+          make -j$(nproc) ARCH=arm64 LLVM=1 modules_prepare 2>&1 | tail -15
 
       - name: 编译 mykc_core.ko
         run: |
           cd $GITHUB_WORKSPACE
-          CLANG=${{ env.CLANG_BIN }}
-          echo "=== 开始编译模块 ==="
+          export PATH=$(dirname ${{ env.CLANG_BIN }}):$PATH
+          echo "=== 编译模块 ==="
           make -C ${{ env.KERNEL_DIR }} \
             M=$GITHUB_WORKSPACE \
-            ARCH=arm64 \
-            CC=$CLANG \
-            LLVM=1 \
-            modules 2>&1 | tail -40
-
-          echo "=== 编译产物 ==="
-          ls -la *.ko 2>/dev/null || echo "!! 无 .ko 产出"
-          modinfo mykc_core.ko 2>/dev/null | head -10 || true
+            ARCH=arm64 LLVM=1 \
+            modules 2>&1 | tail -50
+          echo "=== 产物 ==="
+          ls -la *.ko 2>/dev/null || echo "!! 无 .ko"
+          modinfo mykc_core.ko 2>/dev/null | head -8 || true
 
       - name: 生成自释放脚本
         run: |
           cd $GITHUB_WORKSPACE
           if [ ! -f mykc_core.ko ]; then
-            echo "❌ 编译失败，未产出 mykc_core.ko"
-            echo "--- 列出所有 .o 看线索 ---"
-            ls -la *.o *.ko 2>/dev/null
+            echo "❌ 编译失败"
+            ls -la *.o 2>/dev/null | head
             exit 1
           fi
           ls -la mykc_core.ko
-
-          printf '#!/bin/sh\n# mykc self-extract + insmod\nset -e\nTMP=$(mktemp)\ntrap "rm -f \\"$TMP\\"" EXIT INT TERM\nbase64 -d <<'"'"'__MYKC_KO__'"'"' > "$TMP"\n' > mykc.ko.sh
+          printf '#!/bin/sh\nset -e\nTMP=$(mktemp)\ntrap "rm -f \\"$TMP\\"" EXIT INT TERM\nbase64 -d <<'"'"'__MYKC_KO__'"'"' > "$TMP"\n' > mykc.ko.sh
           base64 mykc_core.ko >> mykc.ko.sh
-          printf '__MYKC_KO__\ninsmod "$TMP"\nif [ $? -eq 0 ]; then echo "mykc loaded OK"; else echo "FAILED"; exit 1; fi\n' >> mykc.ko.sh
+          printf '__MYKC_KO__\ninsmod "$TMP" && echo "mykc loaded OK" || echo "FAILED"\n' >> mykc.ko.sh
           chmod 755 mykc.ko.sh
-          echo "打包完成: $(wc -c < mykc.ko.sh) bytes"
+          echo "打包: $(wc -c < mykc.ko.sh) bytes"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
