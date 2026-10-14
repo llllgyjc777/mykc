@@ -46,7 +46,7 @@ jobs:
           grep -E '^VERSION|^PATCHLEVEL|^SUBLEVEL' Makefile 2>/dev/null | head -3
           echo "KERNEL_DIR=$HOME/common" >> $GITHUB_ENV
 
-      - name: 生成模块构建环境
+      - name: 生成模块构建环境 + 编 vmlinux(生成符号表)
         run: |
           cd ${{ env.KERNEL_DIR }}
           CLANG=${{ env.CLANG_BIN }}
@@ -54,9 +54,15 @@ jobs:
           echo "=== gki_defconfig ==="
           make ARCH=arm64 LLVM=1 gki_defconfig 2>&1 | tail -5
           ./scripts/config --file .config -d MODULE_SIG_FORCE 2>/dev/null || true
+          ./scripts/config --file .config -e MODULE_SIG_ALL 2>/dev/null || true
           make ARCH=arm64 LLVM=1 olddefconfig 2>&1 | tail -3
           echo "=== modules_prepare ==="
-          make -j$(nproc) ARCH=arm64 LLVM=1 modules_prepare 2>&1 | tail -15
+          make -j$(nproc) ARCH=arm64 LLVM=1 modules_prepare 2>&1 | tail -10
+          echo "=== 编 vmlinux 生成 Module.symvers (关键!) ==="
+          make -j$(nproc) ARCH=arm64 LLVM=1 vmlinux 2>&1 | tail -20 || true
+          echo "=== 检查 Module.symvers ==="
+          ls -la Module.symvers 2>/dev/null && wc -l Module.symvers
+          grep -cE 'jiffies|memcpy|_raw_spin_lock' Module.symvers 2>/dev/null || echo "(符号表可能仍不全)"
 
       - name: 编译 mykc_core.ko
         run: |
