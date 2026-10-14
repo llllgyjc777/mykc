@@ -18,13 +18,91 @@
 #include <linux/timer.h>
 #include <linux/workqueue.h>
 #include <linux/ktime.h>
-#include <linux/math.h>
 #include <linux/sched/signal.h>
 #include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/pid_namespace.h>
+#include <linux/string.h>
+#include <linux/math64.h>
 
 #include "mykc.h"
+
+/* =====================================================================
+ *  内核态定点数学（内核禁止浮点，这里用定点整数 + 查表）
+ *  Q16.16 定点: 1.0 = 65536
+ * ===================================================================== */
+#define FIX_SHIFT   16
+#define FIX_ONE     (1 << FIX_SHIFT)          /* 65536 */
+#define FIX_D(f)    ((s32)((f) * (float)FIX_ONE))   /* 编译期常量可用 */
+
+/* 返回 Q16.16 */
+static inline s32 fix_mul(s32 a, s32 b)
+{
+    return (s32)(((s64)a * (s64)b) >> FIX_SHIFT);
+}
+
+/* 整数平方根 */
+static u32 isqrt64(u64 v)
+{
+    u64 r = 0, bit = 1ULL << 62;
+    while (bit > v) bit >>= 2;
+    while (bit) {
+        if (v >= r + bit) {
+            v -= r + bit;
+            r = (r >> 1) + bit;
+        } else {
+            r >>= 1;
+        }
+        bit >>= 2;
+    }
+    return (u32)r;
+}
+
+/* GKI 内核允许浮点: 用整数近似 sin/cos（避免依赖 libm）*/
+static s32 fix_sin(u32 deg)
+{
+    static const u16 sin_tab[91] = {
+          0,  1144,  2287,  3430,  4571,  5712,  6850,  7987,
+       9121, 10252, 11380, 12505, 13626, 14742, 15855, 16962,
+      18064, 19161, 20252, 21336, 22415, 23486, 24550, 25607,
+      26656, 27697, 28729, 29753, 30767, 31772, 32768, 33754,
+      34729, 35693, 36647, 37590, 38521, 39441, 40348, 41243,
+      42126, 42995, 43852, 44695, 45525, 46341, 47143, 47930,
+      48703, 49461, 50203, 50931, 51643, 52339, 53020, 53684,
+      54332, 54963, 55578, 56175, 56756, 57319, 57865, 58393,
+      58903, 59396, 59870, 60326, 60764, 61183, 61584, 61966,
+      62328, 62672, 62997, 63303, 63589, 63856, 64104, 64332,
+      64540, 64729, 64898, 65048, 65177, 65287, 65377, 65447,
+      65497, 65527, 65536
+    };
+    u8 q;
+    deg %= 360;
+    q = deg / 90;
+    deg %= 90;
+    switch (q) {
+    case 0: return  (s32)sin_tab[deg];
+    case 1: return  (s32)sin_tab[90 - deg];
+    case 2: return -(s32)sin_tab[deg];
+    default: return -(s32)sin_tab[90 - deg];
+    }
+}
+
+static s32 fix_cos(u32 deg)
+{
+    return fix_sin((deg + 90) % 360);
+}
+
+/* 度数(float) -> 整数度 */
+static inline u32 deg_of(float f)
+{
+    s32 d = (s32)f;
+    return (u32)((d % 360 + 360) % 360);
+}
+
+/* =====================================================================
+ *  浮点 W2S —— GKI 允许在 workqueue 上下文用 FP
+ *  (若编译报错, 改用下方 fix_* 版本)
+ * ===================================================================== */
 
 /* core 提供的接口 */
 int  mykc_read_mm(struct mm_struct *mm, u64 vaddr, void *dst, size_t len);
@@ -45,11 +123,9 @@ void mykc_put_mm(struct mm_struct *mm, struct task_struct *task);
 #define OFF_ACTOR_POV    0x14B0ULL
 #define OFF_POV_FOV      0x30ULL
 
-#define PLAYER_HALF      90.0f
-#define SHOULDER_RATIO   0.35f
+#define PLAYER_HALF_CM   90      /* 胶囊体中心 ±90cm */
+#define SHOULDER_PCT     35      /* 肩宽/身高 ≈ 35% */
 #define MAX_ITER         20000
-#define PI_F             3.14159265f
-#define D2R              (PI_F / 180.0f)
 
 /* =====================================================================
  *  全局状态
@@ -141,53 +217,70 @@ typedef struct {
     int W, H;
 } EspCam;
 
-static int esp_w2s(const EspCam *c, V3 t, float *sx, float *sy)
+/* ---------------------------------------------------------------------
+ * 纯整数 W2S（不调用任何 libm 浮点函数）
+ *   坐标单位 cm；sin/cos 用查表；结果屏幕像素
+ * ------------------------------------------------------------------- */
+static int esp_w2s(const EspCam *c, s32 X, s32 Y, s32 Z, s32 *psx, s32 *psy)
 {
-    float dx, dy, dz, cp, sp, cy, syw;
-    float Fx, Fy, Fz, Ux, Uy, Uz;
-    float xr, yr, zr, focal;
+    s32 dx, dy, dz;
+    s32 cp, sp, cy, syw;
+    s32 Fx, Fy, Fz, Ux, Uy, Uz;
+    s32 xr, yr, zr, focal, tan_half, sh, ch;
+    s32 ratio_x, ratio_y, half_w, half_h;
 
-    dx = t.x - c->loc.x;
-    dy = t.y - c->loc.y;
-    dz = t.z - c->loc.z;
+    dx = X - (s32)c->loc.x;
+    dy = Y - (s32)c->loc.y;
+    dz = Z - (s32)c->loc.z;
 
-    cp = cosf(c->pitch * D2R);
-    sp = sinf(c->pitch * D2R);
-    cy = cosf(c->yaw * D2R);
-    syw = sinf(c->yaw * D2R);
+    cp  = fix_cos(deg_of(c->pitch));
+    sp  = fix_sin(deg_of(c->pitch));
+    cy  = fix_cos(deg_of(c->yaw));
+    syw = fix_sin(deg_of(c->yaw));
 
-    Fx = cp * cy;  Fy = cp * syw;  Fz = sp;
-    Ux = -sp * cy; Uy = -sp * syw; Uz = cp;
+    Fx = fix_mul(cp, cy);  Fy = fix_mul(cp, syw);  Fz = sp;
+    Ux = -fix_mul(sp, cy); Uy = -fix_mul(sp, syw); Uz = cp;
 
-    xr = dx * (-syw) + dy * cy;
-    yr = dx * Ux + dy * Uy + dz * Uz;
-    zr = dx * Fx + dy * Fy + dz * Fz;
+    /* xr/yr 用到右向 Rx=-syw, Ry=cy */
+    xr = fix_mul(dx, -syw) + fix_mul(dy, cy);
+    yr = fix_mul(dx, Ux) + fix_mul(dy, Uy) + fix_mul(dz, Uz);
+    zr = fix_mul(dx, Fx) + fix_mul(dy, Fy) + fix_mul(dz, Fz);
 
-    if (zr < 1.0f) return 0;
+    if (zr < FIX_ONE) return 0;   /* zr < 1.0 -> 在相机后面 */
 
-    focal = ((float)c->W * 0.5f) / tanf(c->fov * 0.5f * D2R);
-    *sx = (float)c->W * 0.5f + (xr / zr) * focal;
-    *sy = (float)c->H * 0.5f - (yr / zr) * focal;
+    /* focal = (W/2) / tan(fov/2) */
+    sh = fix_sin(deg_of(c->fov * 0.5f));
+    ch = fix_cos(deg_of(c->fov * 0.5f));
+    if (ch == 0) ch = 1;
+    tan_half = (s32)(((s64)sh << FIX_SHIFT) / ch);
+    if (tan_half == 0) tan_half = 1;
+    half_w = c->W / 2;
+    focal = (s32)(((s64)half_w << FIX_SHIFT) / tan_half);   /* Q16.16 */
+
+    ratio_x = (s32)(((s64)xr << FIX_SHIFT) / zr);   /* Q16.16 */
+    ratio_y = (s32)(((s64)yr << FIX_SHIFT) / zr);
+    half_h = c->H / 2;
+
+    *psx = half_w + (fix_mul(ratio_x, focal) >> FIX_SHIFT);
+    *psy = half_h - (fix_mul(ratio_y, focal) >> FIX_SHIFT);
     return 1;
 }
 
-static void esp_box_of(const EspCam *c, V3 foot,
+static void esp_box_of(const EspCam *c, s32 X, s32 Y, s32 Z,
                        float *x0, float *y0, float *x1, float *y1)
 {
-    V3 bot = { foot.x, foot.y, foot.z - PLAYER_HALF };
-    V3 top = { foot.x, foot.y, foot.z + PLAYER_HALF };
-    float sx, sy, hx, hy, h, w;
+    s32 sx, sy, hx, hy, h, w;
 
-    if (!esp_w2s(c, bot, &sx, &sy)) { *x0 = *y0 = *x1 = *y1 = -9999; return; }
-    if (!esp_w2s(c, top, &hx, &hy)) { *x0 = *y0 = *x1 = *y1 = -9999; return; }
+    if (!esp_w2s(c, X, Y, Z - 90, &sx, &sy)) { *x0=*y0=*x1=*y1=-9999; return; }
+    if (!esp_w2s(c, X, Y, Z + 90, &hx, &hy)) { *x0=*y0=*x1=*y1=-9999; return; }
 
     h = sy - hy; if (h < 0) h = -h; if (h < 2) h = 2;
-    w = h * SHOULDER_RATIO;
+    w = h * 35 / 100;    /* 0.35 */
 
-    *x0 = sx - w * 0.5f;
-    *y0 = hy;
-    *x1 = sx + w * 0.5f;
-    *y1 = sy;
+    *x0 = (float)(sx - w/2);
+    *y0 = (float)hy;
+    *x1 = (float)(sx + w/2);
+    *y1 = (float)sy;
 }
 
 /* 找相机 POV */
@@ -324,9 +417,10 @@ static int esp_scan_frame(struct mm_struct *mm, struct mykc_espframe *out)
     for (i = 0; i < n && i < MAX_ITER && box_n < MYKC_BOX_MAX; i++) {
         u64 a = esp_rp(mm, arr + (u64)i * 8);
         u64 cls, root;
-        V3 pos;
+        s32 px, py, pz;
         float hp, x0, y0, x1, y1;
-        float dx, dy, dz, dist_m;
+        s32 ddx, ddy, ddz;
+        u32 dist_cm, dist_m;
 
         if (!esp_readable(mm, a)) continue;
         cls = esp_rp(mm, a + OFF_ACTOR_CLS);
@@ -338,26 +432,27 @@ static int esp_scan_frame(struct mm_struct *mm, struct mykc_espframe *out)
         root = esp_rp(mm, a + OFF_ACTOR_ROOT);
         if (!esp_readable(mm, root)) continue;
 
-        pos.x = esp_rf(mm, root + OFF_ROOT_POS);
-        pos.y = esp_rf(mm, root + OFF_ROOT_POS + 4);
-        pos.z = esp_rf(mm, root + OFF_ROOT_POS + 8);
-        if (pos.z < -1000.0f || pos.z > 1e5f) continue;
+        px = (s32)esp_rf(mm, root + OFF_ROOT_POS);
+        py = (s32)esp_rf(mm, root + OFF_ROOT_POS + 4);
+        pz = (s32)esp_rf(mm, root + OFF_ROOT_POS + 8);
+        if (pz < -1000 || pz > 100000) continue;
 
-        dx = pos.x - cam.loc.x;
-        dy = pos.y - cam.loc.y;
-        dz = pos.z - cam.loc.z;
-        dist_m = sqrtf(dx*dx + dy*dy + dz*dz) / 100.0f;
+        ddx = px - (s32)cam.loc.x;
+        ddy = py - (s32)cam.loc.y;
+        ddz = pz - (s32)cam.loc.z;
+        dist_cm = isqrt64((u64)((s64)ddx*ddx + (s64)ddy*ddy + (s64)ddz*ddz));
+        dist_m = dist_cm / 100;
 
-        if (g_esp.max_dist && dist_m > (float)g_esp.max_dist) continue;
+        if (g_esp.max_dist && dist_m > g_esp.max_dist) continue;
 
-        esp_box_of(&cam, pos, &x0, &y0, &x1, &y1);
+        esp_box_of(&cam, px, py, pz, &x0, &y0, &x1, &y1);
         if (x0 <= -9000) continue;
 
         out->boxes[box_n].x0 = x0;
         out->boxes[box_n].y0 = y0;
         out->boxes[box_n].x1 = x1;
         out->boxes[box_n].y1 = y1;
-        out->boxes[box_n].dist = dist_m;
+        out->boxes[box_n].dist = (float)dist_m;
         out->boxes[box_n].hp = hp;
         out->boxes[box_n].flags = MYKC_BOX_VISIBLE;
         box_n++;
