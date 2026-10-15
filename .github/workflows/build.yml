@@ -79,25 +79,19 @@ jobs:
           echo "PATH 前段 = $(echo $PATH | cut -d: -f1)"
           which ld.lld || echo "!! which ld.lld 失败"
 
-          echo "=== 生成 .config (优先用设备真实 config) ==="
-          # ★ 关键: 设备开了 ARM64_BTI + CFI_CLANG + SHADOW_CALL_STACK,
-          #   必须用设备真实 config, 否则编出的 .ko 属性不匹配 → insmod ENOEXEC!
+          echo "=== 生成 .config (用 gki_defconfig; device.config 与 AOSP 源码树不兼容) ==="
+          # ★ 注: 设备 /proc/config.gz 含厂商私有项, 与 AOSP kernel_common 源码树不兼容,
+          #   直接用会导致 vmlinux 编译失败(Makefile:1968 Error 2)。
+          #   正确做法: 用 gki_defconfig 编, 再靠 CFLAGS 补 BTI 属性对齐设备。
           set +e
-          if [ -f "$GITHUB_WORKSPACE/device.config" ]; then
-            echo "★ 使用设备真实 config: device.config"
-            cp "$GITHUB_WORKSPACE/device.config" .config
-            RC=0
-          else
-            echo "★ 无 device.config, 回退 gki_defconfig"
-            make ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld gki_defconfig > /tmp/defconfig.log 2>&1
-            RC=$?
-            echo "--- gki_defconfig 退出码 = $RC ---"
-            tail -25 /tmp/defconfig.log
-            if [ $RC -ne 0 ]; then
-              echo "❌ gki_defconfig 失败! 完整日志:"
-              cat /tmp/defconfig.log
-              exit 1
-            fi
+          make ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld gki_defconfig > /tmp/defconfig.log 2>&1
+          RC=$?
+          echo "--- gki_defconfig 退出码 = $RC ---"
+          tail -25 /tmp/defconfig.log
+          if [ $RC -ne 0 ]; then
+            echo "❌ gki_defconfig 失败! 完整日志:"
+            cat /tmp/defconfig.log
+            exit 1
           fi
           set -e
 
@@ -177,6 +171,7 @@ jobs:
           # ★ 不再用 KBUILD_MODPOST_WARN=1 (禁止用警告兜底出半残 .ko)
           # ★ 符号必须有地址, 否则 insmod 会 panic
           # ★ 用 pipefail 让 make 的失败退出码不被 tail 吞掉
+          # ★ 设备开了 ARM64_BTI + CFI_CLANG, 模块必须带 bti 属性, 否则 insmod ENOEXEC!
           set -o pipefail
           make -C ${{ env.KERNEL_DIR }} \
             M=$GITHUB_WORKSPACE \
@@ -184,6 +179,7 @@ jobs:
             CC=$CLANG \
             LLVM=1 \
             LD=ld.lld \
+            CFLAGS_MODULE="-mbranch-protection=standard" \
             modules 2>&1 | tail -80
           MAKE_RC=${PIPESTATUS[0]}
           echo "make 退出码 = $MAKE_RC"
