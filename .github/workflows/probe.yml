@@ -1,0 +1,66 @@
+name: ProbeClang
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe googlesource structure
+        run: |
+          set -x
+          echo "=== 0. runner info ==="
+          uname -a
+          git --version
+
+          echo "=== 1. 探测 googlesource clang 仓库顶层 (main) ==="
+          curl -sS --max-time 30 -o /tmp/clangtop.txt -w "HTTP=%{http_code}\n" \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/refs/heads/main?format=TEXT" || true
+          head -c 200 /tmp/clangtop.txt 2>/dev/null | base64 -d 2>/dev/null | head -60 || head -c 200 /tmp/clangtop.txt
+
+          echo
+          echo "=== 2. 探测 clang-r510928 目录是否存在 (main) ==="
+          for D in clang-r510928 clang-r522817 clang-r547379 clang-r530567 clang-r487747c; do
+            C=$(curl -sS --max-time 25 -o /dev/null -w "%{http_code}" \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/refs/heads/main/$D?format=TEXT" || echo "000")
+            echo "main/$D -> HTTP=$C"
+          done
+
+          echo
+          echo "=== 3. 探测多个 ref 下 clang-r510928 ==="
+          for R in refs/heads/main refs/heads/android15-release refs/heads/android14-release \
+                   refs/tags/android-15.0.0_r1 refs/tags/android-14.0.0_r1 refs/tags/android-15.0.0_r15; do
+            C=$(curl -sS --max-time 25 -o /dev/null -w "%{http_code}" \
+              "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+/$R/clang-r510928?format=TEXT" || echo "000")
+            echo "$R/clang-r510928 -> HTTP=$C"
+          done
+
+          echo
+          echo "=== 4. 试直接下载 tarball (archive 语法) ==="
+          for U in \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r510928.tar.gz" \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-15.0.0_r1/clang-r510928.tar.gz" \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/android15-release/clang-r510928.tar.gz" ; do
+            C=$(curl -sS -L --max-time 40 -o /tmp/t.tgz -w "%{http_code} size=%{size_download}" "$U" || echo "000")
+            echo "$U"
+            echo "   -> HTTP=$C"
+            file /tmp/t.tgz 2>/dev/null
+          done
+
+          echo
+          echo "=== 5. 探测 manifest 里 clang 的路径 (android15 branch) ==="
+          curl -sS --max-time 30 -o /tmp/mf.xml -w "HTTP=%{http_code}\n" \
+            "https://android.googlesource.com/kernel/manifest/+/refs/heads/android15-6.6?format=TEXT" || true
+          base64 -d /tmp/mf.xml 2>/dev/null | grep -i clang | head -20 || true
+
+          echo
+          echo "=== 6. 试 kernel prebuilts 直接路径 (build-tools) ==="
+          for U in \
+            "https://android.googlesource.com/kernel/prebuilts/build-tools/+/refs/heads/main/linux-x86/clang-r510928?format=TEXT" \
+            "https://android.googlesource.com/kernel/prebuilts/build-tools/+archive/refs/heads/main/linux-x86/clang-r510928.tar.gz" ; do
+            C=$(curl -sS -L --max-time 40 -o /dev/null -w "%{http_code}" "$U" || echo "000")
+            echo "$U -> HTTP=$C"
+          done
+
+          echo "=== PROBE DONE ==="
