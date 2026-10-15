@@ -7,6 +7,8 @@
 
 obj-m += mykc_core.o
 mykc_core-objs := mykc_main.o mykc_esp.o
+# ★ 对照实验用最小模块（验证编译环境是否能产出可 insmod 的 .ko）
+obj-m += hello_min.o
 # 说明: mykc_main.c 是主体(ioctl/内存引擎), mykc_esp.c 是 ESP 引擎
 #       二者一起链接成单个 mykc_core.ko
 #       注意: 主体文件必须叫 mykc_main.c（不能叫 mykc_core.c，否则和 obj-m 冲突）
