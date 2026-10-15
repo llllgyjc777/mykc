@@ -35,7 +35,7 @@
  * ===================================================================== */
 #define FIX_SHIFT   16
 #define FIX_ONE     (1 << FIX_SHIFT)          /* 65536 */
-#define FIX_D(f)    ((s32)((f) * (float)FIX_ONE))   /* 编译期常量可用 */
+/* ★ 内核禁浮点: FIX_D 宏已移除(含 float 运算); 定点常量直接写整数 */
 
 /* 返回 Q16.16 */
 static inline s32 fix_mul(s32 a, s32 b)
@@ -94,10 +94,10 @@ static s32 fix_cos(u32 deg)
     return fix_sin((deg + 90) % 360);
 }
 
-/* 度数(float) -> 整数度 */
-static inline u32 deg_of(float f)
+/* 度数(定点×100) -> 整数度; 入参为 esp_rfi 返回值(值×100) */
+static inline u32 deg_of(s32 f100)
 {
-    s32 d = (s32)f;
+    s32 d = f100 / 100;             /* 还原整数度 */
     return (u32)((d % 360 + 360) % 360);
 }
 
@@ -204,12 +204,61 @@ static u32 esp_ru32(struct mm_struct *mm, u64 addr)
     return v;
 }
 
+/* 读 4 字节原样 (位模式, 不解释类型) */
+static u32 esp_ru32raw(struct mm_struct *mm, u64 addr)
+{
+    u32 v = 0;
+    esp_read(mm, addr, &v, 4);
+    return v;
+}
+
+/* ---------------------------------------------------------------------
+ * ★ 内核禁止浮点: 读取 IEEE754 float 字段, 用纯位运算转成定点整数
+ *   返回「值 × 100」的 s32 (即 Q 小数2位), 例: 795723.0 -> 79572300
+ *   IEEE754: sign(1) exp(8) frac(23)  value = (-1)^s * 2^(e-127) * 1.m
+ * ------------------------------------------------------------------- */
+static s32 esp_rfi(struct mm_struct *mm, u64 addr)
+{
+    u32 b = esp_ru32raw(mm, addr);
+    u32 sign, exp, frac, mant;
+    s32 e, sh;
+    s64 val;
+
+    sign = (b >> 31) & 1;
+    exp  = (b >> 23) & 0xFF;
+    frac = b & 0x7FFFFF;
+
+    if (exp == 0 && frac == 0) return 0;          /* ±0 */
+    if (exp == 0xFF) return 0;                    /* Inf/NaN -> 0 */
+
+    mant = (1u << 23) | frac;                     /* 1.m 的 24bit */
+    e    = (s32)exp - 127 - 23;                   /* mant 现在是整数, 实际值 = mant * 2^e */
+
+    /* 目标: value * 100, 即 mant * 2^e * 100 */
+    val = (s64)mant * 100;
+
+    if (e >= 0) {
+        if (e > 40) e = 40;                       /* 防溢出 */
+        val <<= e;
+    } else {
+        sh = -e;
+        if (sh > 40) { val = 0; }
+        else val >>= sh;
+    }
+
+    if (sign) val = -val;
+    return (s32)val;
+}
+
+/* 旧的 float 版(保留但标记不用), 内核编译会报错, 已全部替换 */
+#if 0
 static float esp_rf(struct mm_struct *mm, u64 addr)
 {
     float v = 0.0f;
     esp_read(mm, addr, &v, 4);
     return v;
 }
+#endif
 
 static int esp_readable(struct mm_struct *mm, u64 addr)
 {
@@ -221,10 +270,10 @@ static int esp_readable(struct mm_struct *mm, u64 addr)
 /* =====================================================================
  *  内核态 W2S
  * ===================================================================== */
-typedef struct { float x, y, z; } V3;
+typedef struct { s32 x, y, z; } V3;          /* ★ 坐标值×100 定点 */
 typedef struct {
-    V3 loc;
-    float pitch, yaw, roll, fov;
+    V3 loc;                                  /* 相机世界坐标(值×100) */
+    s32 pitch, yaw, roll, fov;               /* 角度值×100 */
     int W, H;
 } EspCam;
 
@@ -240,9 +289,10 @@ static int esp_w2s(const EspCam *c, s32 X, s32 Y, s32 Z, s32 *psx, s32 *psy)
     s32 xr, yr, zr, focal, tan_half, sh, ch;
     s32 ratio_x, ratio_y, half_w, half_h;
 
-    dx = X - (s32)c->loc.x;
-    dy = Y - (s32)c->loc.y;
-    dz = Z - (s32)c->loc.z;
+    /* ★ X/Y/Z 与 c->loc 均为「值×100」定点 */
+    dx = X - c->loc.x;
+    dy = Y - c->loc.y;
+    dz = Z - c->loc.z;
 
     cp  = fix_cos(deg_of(c->pitch));
     sp  = fix_sin(deg_of(c->pitch));
@@ -252,6 +302,9 @@ static int esp_w2s(const EspCam *c, s32 X, s32 Y, s32 Z, s32 *psx, s32 *psy)
     Fx = fix_mul(cp, cy);  Fy = fix_mul(cp, syw);  Fz = sp;
     Ux = -fix_mul(sp, cy); Uy = -fix_mul(sp, syw); Uz = cp;
 
+    /* dx/dy/dz 是「值×100」, fix_mul 期望 Q16.16 → 先降到 Q16.16(即 value) */
+    dx /= 100; dy /= 100; dz /= 100;
+
     /* xr/yr 用到右向 Rx=-syw, Ry=cy */
     xr = fix_mul(dx, -syw) + fix_mul(dy, cy);
     yr = fix_mul(dx, Ux) + fix_mul(dy, Uy) + fix_mul(dz, Uz);
@@ -259,9 +312,9 @@ static int esp_w2s(const EspCam *c, s32 X, s32 Y, s32 Z, s32 *psx, s32 *psy)
 
     if (zr < FIX_ONE) return 0;   /* zr < 1.0 -> 在相机后面 */
 
-    /* focal = (W/2) / tan(fov/2) */
-    sh = fix_sin(deg_of(c->fov * 0.5f));
-    ch = fix_cos(deg_of(c->fov * 0.5f));
+    /* focal = (W/2) / tan(fov/2);  fov 为「值×100」→ deg_of 内部 /100 */
+    sh = fix_sin(deg_of(c->fov / 2));
+    ch = fix_cos(deg_of(c->fov / 2));
     if (ch == 0) ch = 1;
     tan_half = (s32)(((s64)sh << FIX_SHIFT) / ch);
     if (tan_half == 0) tan_half = 1;
@@ -278,20 +331,21 @@ static int esp_w2s(const EspCam *c, s32 X, s32 Y, s32 Z, s32 *psx, s32 *psy)
 }
 
 static void esp_box_of(const EspCam *c, s32 X, s32 Y, s32 Z,
-                       float *x0, float *y0, float *x1, float *y1)
+                       s32 *x0, s32 *y0, s32 *x1, s32 *y1)
 {
     s32 sx, sy, hx, hy, h, w;
 
-    if (!esp_w2s(c, X, Y, Z - 90, &sx, &sy)) { *x0=*y0=*x1=*y1=-9999; return; }
-    if (!esp_w2s(c, X, Y, Z + 90, &hx, &hy)) { *x0=*y0=*x1=*y1=-9999; return; }
+    /* ★ 单位是「值×100」, 身高偏移 90cm = 9000 */
+    if (!esp_w2s(c, X, Y, Z - 9000, &sx, &sy)) { *x0=*y0=*x1=*y1=-9999; return; }
+    if (!esp_w2s(c, X, Y, Z + 9000, &hx, &hy)) { *x0=*y0=*x1=*y1=-9999; return; }
 
     h = sy - hy; if (h < 0) h = -h; if (h < 2) h = 2;
     w = h * 35 / 100;    /* 0.35 */
 
-    *x0 = (float)(sx - w/2);
-    *y0 = (float)hy;
-    *x1 = (float)(sx + w/2);
-    *y1 = (float)sy;
+    *x0 = sx - w/2;
+    *y0 = hy;
+    *x1 = sx + w/2;
+    *y1 = sy;
 }
 
 /* 找相机 POV ★ 同时输出「自己的 Actor」地址（相机挂在自己身上）*/
@@ -301,24 +355,25 @@ static u64 esp_find_cam(struct mm_struct *mm, u64 arr, int n, u64 *out_self)
     for (i = 0; i < n && i < MAX_ITER; i++) {
         u64 a = esp_rp(mm, arr + (u64)i * 8);
         u64 pov;
-        float x, y, z, p, yy, r, fv;
+        s32 x, y, z, p, yy, r, fv;   /* ★ 全部「值×100」定点 */
 
         if (!esp_readable(mm, a)) continue;
         pov = a + OFF_ACTOR_POV;
-        x  = esp_rf(mm, pov);
-        y  = esp_rf(mm, pov + 4);
-        z  = esp_rf(mm, pov + 8);
-        p  = esp_rf(mm, pov + 0x18);
-        yy = esp_rf(mm, pov + 0x1C);
-        r  = esp_rf(mm, pov + 0x20);
-        fv = esp_rf(mm, pov + OFF_POV_FOV);
+        x  = esp_rfi(mm, pov);
+        y  = esp_rfi(mm, pov + 4);
+        z  = esp_rfi(mm, pov + 8);
+        p  = esp_rfi(mm, pov + 0x18);
+        yy = esp_rfi(mm, pov + 0x1C);
+        r  = esp_rfi(mm, pov + 0x20);
+        fv = esp_rfi(mm, pov + OFF_POV_FOV);
 
-        if (x > 1e5f && x < 1.5e6f && y > 1e5f && y < 1.5e6f &&
-            z > 500 && z < 5000 &&
-            (p < 0 ? -p : p) <= 89.5f &&
-            (yy < 0 ? -yy : yy) <= 360.5f &&
-            (r < 0 ? -r : r) <= 1.5f &&
-            fv >= 50 && fv <= 110) {
+        /* 阈值×100: [1e5,1.5e6]*100; [500,5000]*100; 89.5*100; 360.5*100; 1.5*100; [50,110]*100 */
+        if (x > 10000000 && x < 150000000 && y > 10000000 && y < 150000000 &&
+            z > 50000 && z < 500000 &&
+            (p < 0 ? -p : p) <= 8950 &&
+            (yy < 0 ? -yy : yy) <= 36050 &&
+            (r < 0 ? -r : r) <= 150 &&
+            fv >= 5000 && fv <= 11000) {
             if (out_self) *out_self = a;   /* ★ 相机宿主 = 自己 */
             return pov;
         }
@@ -399,19 +454,19 @@ static u64 esp_pick_player_cls(struct mm_struct *mm, u64 arr, int n)
         for (k = 0; k < n && valid < 60 && k < MAX_ITER; k++) {
             u64 a = esp_rp(mm, arr + (u64)k * 8);
             u64 root;
-            float h, hm, wx, wy;
+            s32 h, hm, wx, wy;   /* ★ 值×100 定点 */
             if (!esp_readable(mm, a)) continue;
             if (esp_rp(mm, a + OFF_ACTOR_CLS) != g_esp.classes[i].cls) continue;
             valid++;
-            h = esp_rf(mm, a + OFF_ACTOR_HP);          /* hp @ 0x1060 */
-            if (h >= 1.0f && h <= 100.0f) h60++;
-            hm = esp_rf(mm, a + OFF_ACTOR_MAXHP);       /* hpmax @ 0x1068 */
-            if (hm >= 1.0f && hm <= 100.0f) h68++;
+            h = esp_rfi(mm, a + OFF_ACTOR_HP);          /* hp @ 0x1060 (值×100) */
+            if (h >= 100 && h <= 10000) h60++;          /* [1.0,100.0]*100 */
+            hm = esp_rfi(mm, a + OFF_ACTOR_MAXHP);      /* hpmax @ 0x1068 */
+            if (hm >= 100 && hm <= 10000) h68++;
             root = esp_rp(mm, a + OFF_ACTOR_ROOT);
             if (esp_readable(mm, root)) {
-                wx = esp_rf(mm, root + OFF_ROOT_POS);
-                wy = esp_rf(mm, root + OFF_ROOT_POS + 4);
-                if (wx > 1e5f && wx < 1.5e6f && wy > 1e5f && wy < 1.5e6f) hxy++;
+                wx = esp_rfi(mm, root + OFF_ROOT_POS);
+                wy = esp_rfi(mm, root + OFF_ROOT_POS + 4);
+                if (wx > 10000000 && wx < 150000000 && wy > 10000000 && wy < 150000000) hxy++;
             }
         }
         if (valid < 2) continue;
@@ -471,30 +526,31 @@ static int esp_scan_frame(struct mm_struct *mm, struct mykc_espframe *out)
     player_cls = g_esp.cached_player_cls;
     if (!cam_pov || !player_cls) return -EAGAIN;
 
-    cam.loc.x = esp_rf(mm, cam_pov);
-    cam.loc.y = esp_rf(mm, cam_pov + 4);
-    cam.loc.z = esp_rf(mm, cam_pov + 8);
-    cam.pitch = esp_rf(mm, cam_pov + 0x18);
-    cam.yaw   = esp_rf(mm, cam_pov + 0x1C);
-    cam.roll  = esp_rf(mm, cam_pov + 0x20);
-    cam.fov   = esp_rf(mm, cam_pov + OFF_POV_FOV);
+    cam.loc.x = esp_rfi(mm, cam_pov);
+    cam.loc.y = esp_rfi(mm, cam_pov + 4);
+    cam.loc.z = esp_rfi(mm, cam_pov + 8);
+    cam.pitch = esp_rfi(mm, cam_pov + 0x18);
+    cam.yaw   = esp_rfi(mm, cam_pov + 0x1C);
+    cam.roll  = esp_rfi(mm, cam_pov + 0x20);
+    cam.fov   = esp_rfi(mm, cam_pov + OFF_POV_FOV);
     cam.W = g_esp.screen_w;
     cam.H = g_esp.screen_h;
-    if (cam.fov < 50 || cam.fov > 110) cam.fov = 80.0f;
+    /* fov 有效范围 [50,110]*100; 非法则用 80.0*100 */
+    if (cam.fov < 5000 || cam.fov > 11000) cam.fov = 8000;
 
     for (i = 0; i < n && i < MAX_ITER && box_n < MYKC_BOX_MAX; i++) {
         u64 a = esp_rp(mm, arr + (u64)i * 8);
         u64 cls, root;
         s32 px, py, pz;
-        float hp, x0, y0, x1, y1;
+        s32 hp, x0, y0, x1, y1;    /* ★ 值×100 定点 */
         s32 ddx, ddy, ddz;
         u32 dist_cm, dist_m;
 
         if (!esp_readable(mm, a)) continue;
         cls = esp_rp(mm, a + OFF_ACTOR_CLS);
         if (cls != player_cls) continue;
-        hp = esp_rf(mm, a + OFF_ACTOR_HP);
-        if (hp <= 0.0f || hp > 100.0f) continue;
+        hp = esp_rfi(mm, a + OFF_ACTOR_HP);
+        if (hp <= 0 || hp > 10000) continue;   /* (0, 100.0]*100 */
 
 #if MYKC_ESP_DBG_TEAM
         /* ★ 节流: 每 2 秒最多打印一次(避免 pr_info 刷屏拖垮内核日志/帧率)
@@ -506,8 +562,8 @@ static int esp_scan_frame(struct mm_struct *mm, struct mykc_espframe *out)
                 last_dbg_jiffies = jiffies;
                 u32 dbg_team = esp_ru32(mm, a + OFF_ACTOR_TEAM);
             u32 dbg_bot  = esp_ru32(mm, a + OFF_ACTOR_BOT);
-            pr_info("actor=%llx hp=%.0f team=0x%x bot=0x%x self=%d(my_team=0x%x)\n",
-                    (unsigned long long)a, hp, dbg_team, dbg_bot,
+            pr_info("actor=%llx hp=%d.%02d team=0x%x bot=0x%x self=%d(my_team=0x%x)\n",
+                    (unsigned long long)a, hp / 100, hp % 100, dbg_team, dbg_bot,
                     g_esp.self_team_valid, g_esp.self_team);
             }
         }
@@ -520,15 +576,17 @@ static int esp_scan_frame(struct mm_struct *mm, struct mykc_espframe *out)
         root = esp_rp(mm, a + OFF_ACTOR_ROOT);
         if (!esp_readable(mm, root)) continue;
 
-        px = (s32)esp_rf(mm, root + OFF_ROOT_POS);
-        py = (s32)esp_rf(mm, root + OFF_ROOT_POS + 4);
-        pz = (s32)esp_rf(mm, root + OFF_ROOT_POS + 8);
-        if (pz < -1000 || pz > 100000) continue;
+        /* ★ px/py/pz 与 cam.loc 均为「值×100」 */
+        px = esp_rfi(mm, root + OFF_ROOT_POS);
+        py = esp_rfi(mm, root + OFF_ROOT_POS + 4);
+        pz = esp_rfi(mm, root + OFF_ROOT_POS + 8);
+        if (pz < -100000 || pz > 10000000) continue;   /* [-1000,100000]*100 */
 
-        ddx = px - (s32)cam.loc.x;
-        ddy = py - (s32)cam.loc.y;
-        ddz = pz - (s32)cam.loc.z;
-        dist_cm = isqrt64((u64)((s64)ddx*ddx + (s64)ddy*ddy + (s64)ddz*ddz));
+        ddx = px - cam.loc.x;
+        ddy = py - cam.loc.y;
+        ddz = pz - cam.loc.z;
+        /* ddx 等为「值×100」, 平方后是「值²×10000」, isqrt 后再 /100 → cm */
+        dist_cm = isqrt64((u64)((s64)ddx*ddx + (s64)ddy*ddy + (s64)ddz*ddz)) / 100;
         dist_m = dist_cm / 100;
 
         if (g_esp.max_dist && dist_m > g_esp.max_dist) continue;
@@ -540,8 +598,8 @@ static int esp_scan_frame(struct mm_struct *mm, struct mykc_espframe *out)
         out->boxes[box_n].y0 = y0;
         out->boxes[box_n].x1 = x1;
         out->boxes[box_n].y1 = y1;
-        out->boxes[box_n].dist = (float)dist_m;
-        out->boxes[box_n].hp = hp;
+        out->boxes[box_n].dist = (s32)dist_m;
+        out->boxes[box_n].hp = hp;                  /* 值×100 */
         out->boxes[box_n].flags = MYKC_BOX_VISIBLE;
         box_n++;
     }
