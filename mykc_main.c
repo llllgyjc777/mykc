@@ -35,6 +35,7 @@
 #include <linux/vmalloc.h>
 #include <linux/mmap_lock.h>
 #include <linux/kallsyms.h>
+#include <linux/kprobes.h>      /* ★ kprobe: 动态获取未导出符号 */
 #include <linux/namei.h>
 #include <linux/dcache.h>
 #include <linux/list.h>
@@ -339,10 +340,25 @@ static unsigned long resolve_symbol(const char *name)
     return g_klookup(name);
 }
 
+/* ★ 用 kprobe 动态获取未导出符号地址(kallsyms_lookup_name 在 5.7+ 不再 EXPORT) */
+static unsigned long kprobe_lookup_name(const char *name)
+{
+    struct kprobe kp;
+    unsigned long addr = 0;
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = "kallsyms_lookup_name";
+    if (register_kprobe(&kp) == 0) {
+        addr = (unsigned long)kp.addr;
+        unregister_kprobe(&kp);
+    }
+    return addr;
+}
+
 static void init_klookup(void)
 {
-    g_klookup = (klookup_t)kallsyms_lookup_name;
-    pr_info("kallsyms_lookup_name %savailable\n", g_klookup ? "" : "NOT ");
+    /* 优先用 kprobe 拿 kallsyms_lookup_name 地址 */
+    g_klookup = (klookup_t)kprobe_lookup_name("kallsyms_lookup_name");
+    pr_info("kallsyms_lookup_name %savailable (via kprobe)\n", g_klookup ? "" : "NOT ");
 }
 
 /* =====================================================================
@@ -538,7 +554,8 @@ static long mykc_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     }
 
     case MYKC_IO_GET_INFO:
-        g_info.kernel_text = (u64)_text;
+        /* ★ _text 未 EXPORT, 用 kallsyms 动态查 (g_klookup 已在 init 时拿到) */
+        g_info.kernel_text = g_klookup ? (u64)resolve_symbol("_text") : 0;
         if (copy_to_user(uarg, &g_info, sizeof(g_info))) return -EFAULT;
         break;
 
