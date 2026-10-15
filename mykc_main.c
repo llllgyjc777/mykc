@@ -34,7 +34,9 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/mmap_lock.h>
-#include <linux/kallsyms.h>
+/* ★ 不 include <linux/kallsyms.h> —— 它会在符号表里引入 kallsyms_lookup_name/_text 的 UND 引用,
+ *   导致 insmod 报 "Unknown symbol" (内核 5.7+ 这俩符号已不 EXPORT)。
+ *   本模块改用 kprobe 动态获取地址 (见 kprobe_lookup_name), 无需该头文件。 */
 #include <linux/kprobes.h>      /* ★ kprobe: 动态获取未导出符号 */
 #include <linux/namei.h>
 #include <linux/dcache.h>
