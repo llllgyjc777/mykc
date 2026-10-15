@@ -91,10 +91,20 @@ jobs:
           make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld modules_prepare 2>&1 | tail -15
 
           echo "=== ★ 编 vmlinux 生成 Module.symvers（关键步骤，可能要 30-60 分钟）==="
-          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld vmlinux 2>&1 | tail -20 || \
-            echo "!! vmlinux 编译未完全成功，继续用 KBUILD_MODPOST_WARN 兜底"
-          echo "=== 检查 Module.symvers ==="
-          ls -la Module.symvers 2>/dev/null && wc -l Module.symvers || echo "无 Module.symvers"
+          # ★ 用 pipefail 让 make 的失败退出码不被 tail 吞掉（否则假 success）
+          set -o pipefail
+          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld vmlinux 2>&1 | tail -30
+          VMLINUX_RC=${PIPESTATUS[0]}
+          echo "=== vmlinux 编译退出码 = $VMLINUX_RC ==="
+          echo "=== 检查 Module.symvers (关键!) ==="
+          if [ ! -f Module.symvers ]; then
+            echo "❌ 致命: Module.symvers 未生成 (vmlinux_rc=$VMLINUX_RC)"
+            echo "❌ 没有符号表 → 编出的 .ko 符号无地址 → insmod 必崩 → 终止!"
+            exit 1
+          fi
+          echo "✅ Module.symvers 已生成, 行数: $(wc -l < Module.symvers)"
+          echo "--- 符号表前5行 ---"
+          head -5 Module.symvers
 
       - name: 编译 mykc_core.ko
         run: |
@@ -104,7 +114,8 @@ jobs:
           echo "PATH 前段 = $(echo $PATH | cut -d: -f1)"
           which ld.lld || echo "!! which ld.lld 仍失败"
           echo "=== 开始编译模块 ==="
-          # KBUILD_MODPOST_WARN=1: 未解析符号降级为警告，保证出 .ko
+          # ★ 不再用 KBUILD_MODPOST_WARN=1 (禁止用警告兜底出半残 .ko)
+          # ★ 符号必须有地址, 否则 insmod 会 panic
           # ★ 用 pipefail 让 make 的失败退出码不被 tail 吞掉
           set -o pipefail
           make -C ${{ env.KERNEL_DIR }} \
@@ -113,7 +124,6 @@ jobs:
             CC=$CLANG \
             LLVM=1 \
             LD=ld.lld \
-            KBUILD_MODPOST_WARN=1 \
             modules 2>&1 | tail -80
           MAKE_RC=${PIPESTATUS[0]}
           echo "make 退出码 = $MAKE_RC"
@@ -123,7 +133,11 @@ jobs:
             echo "❌ 编译未产出 mykc_core.ko (make_rc=$MAKE_RC)"
             exit 1
           fi
-          echo "✅ 编译成功产出 mykc_core.ko"
+          if [ "$MAKE_RC" != "0" ]; then
+            echo "❌ make 返回非零 ($MAKE_RC) → 有未解析符号 → 终止!"
+            exit 1
+          fi
+          echo "✅ 编译成功产出 mykc_core.ko (符号全解析)"
 
       - name: 校验符号表 (查未导出符号 UND)
         run: |
