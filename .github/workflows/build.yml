@@ -33,9 +33,18 @@ jobs:
           if [ -z "$CLANG" ]; then
             CLANG=$(find $HOME/tc/clang-tc -name clang -type f -path '*bin*' | head -1)
           fi
+          CLANG_DIR=$(dirname "$CLANG")
           echo "CLANG_BIN=$CLANG" >> $GITHUB_ENV
+          echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_ENV
+          echo "$CLANG_DIR" >> $GITHUB_PATH
           echo "clang = $CLANG"
+          echo "clang_dir = $CLANG_DIR"
           $CLANG --version | head -2
+          echo "=== 检查 LLVM 链接器 ld.lld ==="
+          ls -la "$CLANG_DIR/ld.lld" || echo "!! ld.lld 缺失"
+          "$CLANG_DIR/ld.lld" --version 2>&1 | head -2 || true
+          echo "=== bin 目录关键工具 ==="
+          ls "$CLANG_DIR" | grep -E 'ld.lld|llvm-ar|llvm-objcopy|llvm-nm|llvm-strip' || true
 
       - name: 下载 GKI 预编译内核产物 (KMI android15-6.6)
         run: |
@@ -63,20 +72,23 @@ jobs:
         run: |
           cd ${{ env.KERNEL_DIR }}
           CLANG=${{ env.CLANG_BIN }}
+          export PATH="${{ env.CLANG_DIR }}:$PATH"
+          echo "PATH 前段 = $(echo $PATH | cut -d: -f1)"
+          which ld.lld || echo "!! which ld.lld 失败"
 
           echo "=== 用 gki_defconfig 生成 .config ==="
-          make ARCH=arm64 CC=$CLANG LLVM=1 gki_defconfig 2>&1 | tail -5
+          make ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld gki_defconfig 2>&1 | tail -5
 
           # 关键: 允许未签名模块
           ./scripts/config --file .config -d MODULE_SIG_FORCE 2>/dev/null || true
           ./scripts/config --file .config -e MODULE_SIG 2>/dev/null || true
-          make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -3
+          make ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld olddefconfig 2>&1 | tail -3
 
           echo "=== modules_prepare (生成头文件 + 符号表) ==="
-          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 modules_prepare 2>&1 | tail -15
+          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld modules_prepare 2>&1 | tail -15
 
           echo "=== ★ 编 vmlinux 生成 Module.symvers（关键步骤，可能要 30-60 分钟）==="
-          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 vmlinux 2>&1 | tail -20 || \
+          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld vmlinux 2>&1 | tail -20 || \
             echo "!! vmlinux 编译未完全成功，继续用 KBUILD_MODPOST_WARN 兜底"
           echo "=== 检查 Module.symvers ==="
           ls -la Module.symvers 2>/dev/null && wc -l Module.symvers || echo "无 Module.symvers"
@@ -85,6 +97,9 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE
           CLANG=${{ env.CLANG_BIN }}
+          export PATH="${{ env.CLANG_DIR }}:$PATH"
+          echo "PATH 前段 = $(echo $PATH | cut -d: -f1)"
+          which ld.lld || echo "!! which ld.lld 仍失败"
           echo "=== 开始编译模块 ==="
           # KBUILD_MODPOST_WARN=1: 未解析符号降级为警告，保证出 .ko
           make -C ${{ env.KERNEL_DIR }} \
@@ -92,12 +107,11 @@ jobs:
             ARCH=arm64 \
             CC=$CLANG \
             LLVM=1 \
+            LD=ld.lld \
             KBUILD_MODPOST_WARN=1 \
-            modules 2>&1 | tail -40
-
+            modules 2>&1 | tail -60
           echo "=== 编译产物 ==="
           ls -la *.ko 2>/dev/null || echo "!! 无 .ko 产出"
-          modinfo mykc_core.ko 2>/dev/null | head -10 || true
 
       - name: 收集产物
         run: |
