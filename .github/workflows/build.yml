@@ -116,6 +116,40 @@ jobs:
           echo "=== 编译产物 ==="
           ls -la *.ko 2>/dev/null || echo "!! 无 .ko 产出"
 
+      - name: 校验符号表 (查未导出符号 UND)
+        run: |
+          cd $GITHUB_WORKSPACE
+          echo "=== 1. 检查是否有未导出符号引用 (会导致 insmod Unknown symbol) ==="
+          BAD=$(llvm-nm -u mykc_core.ko 2>/dev/null | awk '{print $2}' | grep -E '^(kallsyms_lookup_name|_text)$' || true)
+          if [ -n "$BAD" ]; then
+            echo "!! 发现未导出符号引用:"; echo "$BAD"
+            echo "!! 这些符号内核不 EXPORT, insmod 会失败"
+          else
+            echo "OK: 无 kallsyms_lookup_name / _text 的 UND 引用"
+          fi
+          echo "=== 2. 完整 UND 符号列表(供核对) ==="
+          llvm-nm -u mykc_core.ko 2>/dev/null | head -60 || nm -u mykc_core.ko | head -60
+
+      - name: 校验并修正 vermagic (对齐设备内核)
+        run: |
+          cd $GITHUB_WORKSPACE
+          # ★ 设备真实 vermagic 前缀 (小米 K80 Pro / 6.6.118 GKI)
+          #   设备: 6.6.118-android15-8-gc44b714366cc-abogki519650608-4k
+          TARGET_VER="6.6.118-android15-8-gc44b714366cc-abogki519650608-4k"
+          echo "=== 修正前 vermagic ==="
+          modinfo mykc_core.ko 2>/dev/null | grep vermagic || echo "(modinfo 无输出)"
+          echo "=== 运行 patch_vermagic.py ==="
+          python3 patch_vermagic.py mykc_core.ko mykc_core.patched.ko "$TARGET_VER" 2>&1 | tail -20
+          if [ -f mykc_core.patched.ko ]; then
+            mv mykc_core.patched.ko mykc_core.ko
+            echo "=== 修正后 vermagic ==="
+            modinfo mykc_core.ko 2>/dev/null | grep -E 'vermagic|name|license'
+            echo "=== ELF 结构校验 (error 数应为 0) ==="
+            readelf -S mykc_core.ko 2>&1 | grep -c Error || true
+          else
+            echo "!! patch 失败, 保留原始 .ko"
+          fi
+
       - name: 收集产物
         run: |
           cd $GITHUB_WORKSPACE
