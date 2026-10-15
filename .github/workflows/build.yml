@@ -79,17 +79,25 @@ jobs:
           echo "PATH 前段 = $(echo $PATH | cut -d: -f1)"
           which ld.lld || echo "!! which ld.lld 失败"
 
-          echo "=== 用 gki_defconfig 生成 .config ==="
-          # ★ 不吞输出: 全量写日志文件 + 显示退出码
+          echo "=== 生成 .config (优先用设备真实 config) ==="
+          # ★ 关键: 设备开了 ARM64_BTI + CFI_CLANG + SHADOW_CALL_STACK,
+          #   必须用设备真实 config, 否则编出的 .ko 属性不匹配 → insmod ENOEXEC!
           set +e
-          make ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld gki_defconfig > /tmp/defconfig.log 2>&1
-          RC=$?
-          echo "--- gki_defconfig 退出码 = $RC ---"
-          tail -25 /tmp/defconfig.log
-          if [ $RC -ne 0 ]; then
-            echo "❌ gki_defconfig 失败! 完整日志:"
-            cat /tmp/defconfig.log
-            exit 1
+          if [ -f "$GITHUB_WORKSPACE/device.config" ]; then
+            echo "★ 使用设备真实 config: device.config"
+            cp "$GITHUB_WORKSPACE/device.config" .config
+            RC=0
+          else
+            echo "★ 无 device.config, 回退 gki_defconfig"
+            make ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld gki_defconfig > /tmp/defconfig.log 2>&1
+            RC=$?
+            echo "--- gki_defconfig 退出码 = $RC ---"
+            tail -25 /tmp/defconfig.log
+            if [ $RC -ne 0 ]; then
+              echo "❌ gki_defconfig 失败! 完整日志:"
+              cat /tmp/defconfig.log
+              exit 1
+            fi
           fi
           set -e
 
