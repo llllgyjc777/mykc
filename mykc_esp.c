@@ -121,8 +121,14 @@ void mykc_put_mm(struct mm_struct *mm, struct task_struct *task);
 #define OFF_ACTOR_ROOT   0x260ULL
 #define OFF_ROOT_POS     0x200ULL
 #define OFF_ACTOR_HP     0x1060ULL
+#define OFF_ACTOR_MAXHP  0x1068ULL   /* 人物最大血量 */
+#define OFF_ACTOR_TEAM   0x0B78ULL   /* ★ 队伍ID（队友过滤核心）*/
+#define OFF_ACTOR_BOT    0x0B94ULL   /* 人机判断 */
 #define OFF_ACTOR_POV    0x14B0ULL
 #define OFF_POV_FOV      0x30ULL
+
+/* 调试开关：1=每帧把每个 Actor 的队伍ID 打进 dmesg（首次校准用）*/
+#define MYKC_ESP_DBG_TEAM 1
 
 #define PLAYER_HALF_CM   90      /* 胶囊体中心 ±90cm */
 #define SHOULDER_PCT     35      /* 肩宽/身高 ≈ 35% */
@@ -159,7 +165,10 @@ static struct {
     int   cls_count;
     int   cls_capacity;
     u64   cached_cam_pov;
+    u64   cached_self_actor;      /* ★ 自己的 Actor 地址 */
     u64   cached_player_cls;
+    u32   self_team;              /* ★ 自己的队伍ID */
+    int   self_team_valid;        /* ★ 是否拿到了有效队伍ID */
     int   frame_counter;
 
     /* 定时器 */
@@ -284,8 +293,8 @@ static void esp_box_of(const EspCam *c, s32 X, s32 Y, s32 Z,
     *y1 = (float)sy;
 }
 
-/* 找相机 POV */
-static u64 esp_find_cam(struct mm_struct *mm, u64 arr, int n)
+/* 找相机 POV ★ 同时输出「自己的 Actor」地址（相机挂在自己身上）*/
+static u64 esp_find_cam(struct mm_struct *mm, u64 arr, int n, u64 *out_self)
 {
     int i;
     for (i = 0; i < n && i < MAX_ITER; i++) {
@@ -308,10 +317,47 @@ static u64 esp_find_cam(struct mm_struct *mm, u64 arr, int n)
             (p < 0 ? -p : p) <= 89.5f &&
             (yy < 0 ? -yy : yy) <= 360.5f &&
             (r < 0 ? -r : r) <= 1.5f &&
-            fv >= 50 && fv <= 110)
+            fv >= 50 && fv <= 110) {
+            if (out_self) *out_self = a;   /* ★ 相机宿主 = 自己 */
             return pov;
+        }
     }
+    if (out_self) *out_self = 0;
     return 0;
+}
+
+/* =====================================================================
+ *  ★ 队友过滤
+ * ===================================================================== */
+/* 读自身队伍ID：self_actor + 0x0B78 */
+static void esp_update_self_team(struct mm_struct *mm)
+{
+    u32 t = 0;
+
+    g_esp.self_team_valid = 0;
+    if (!g_esp.cached_self_actor) return;
+
+    if (!esp_read(mm, g_esp.cached_self_actor + OFF_ACTOR_TEAM, &t, 4))
+        return;
+
+    /* 合理性校验：队伍ID 一般在 0~100 之间，且不能是 0xFFFFFFFF 这种垃圾 */
+    if (t == 0xFFFFFFFFu || t > 1000u) return;
+
+    g_esp.self_team = t;
+    g_esp.self_team_valid = 1;
+}
+
+/* 判定某 Actor 是否队友 */
+static int esp_is_teammate(struct mm_struct *mm, u64 actor)
+{
+    u32 t = 0;
+
+    if (!g_esp.self_team_valid) return 0;      /* 拿不到自己队伍 → 不过滤 */
+    if (actor == g_esp.cached_self_actor) return 1;  /* 自己 → 也跳过 */
+
+    if (!esp_read(mm, actor + OFF_ACTOR_TEAM, &t, 4)) return 0;
+    if (t == 0xFFFFFFFFu || t > 1000u) return 0;     /* 读不到有效值 → 当敌人 */
+    return (t == g_esp.self_team);
 }
 
 /* =====================================================================
@@ -396,8 +442,9 @@ static int esp_scan_frame(struct mm_struct *mm, struct mykc_espframe *out)
             if (!esp_readable(mm, cls)) continue;
             esp_cls_add(cls);
         }
-        g_esp.cached_cam_pov = esp_find_cam(mm, arr, n);
+        g_esp.cached_cam_pov = esp_find_cam(mm, arr, n, &g_esp.cached_self_actor);
         g_esp.cached_player_cls = esp_pick_player_cls(mm, arr, n);
+        esp_update_self_team(mm);   /* ★ 刷新自身队伍ID */
     }
 
     cam_pov = g_esp.cached_cam_pov;
@@ -426,9 +473,22 @@ static int esp_scan_frame(struct mm_struct *mm, struct mykc_espframe *out)
         if (!esp_readable(mm, a)) continue;
         cls = esp_rp(mm, a + OFF_ACTOR_CLS);
         if (cls != player_cls) continue;
-
         hp = esp_rf(mm, a + OFF_ACTOR_HP);
         if (hp <= 0.0f || hp > 100.0f) continue;
+
+#if MYKC_ESP_DBG_TEAM
+        {
+            u32 dbg_team = esp_ru32(mm, a + OFF_ACTOR_TEAM);
+            u32 dbg_bot  = esp_ru32(mm, a + OFF_ACTOR_BOT);
+            pr_info("actor=%llx hp=%.0f team=0x%x bot=0x%x self=%d(my_team=0x%x)\n",
+                    (unsigned long long)a, hp, dbg_team, dbg_bot,
+                    g_esp.self_team_valid, g_esp.self_team);
+        }
+#endif
+
+        /* ★ 队友过滤：同队 / 自己 → 直接不填框 */
+        if (esp_is_teammate(mm, a)) continue;
+
 
         root = esp_rp(mm, a + OFF_ACTOR_ROOT);
         if (!esp_readable(mm, root)) continue;
