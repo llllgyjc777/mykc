@@ -122,16 +122,36 @@ jobs:
           fi
           set -e
 
-          echo "=== ★ 编 vmlinux 生成 Module.symvers（关键步骤，可能要 30-60 分钟）==="
+          echo "=== ★ 编 vmlinux（关键步骤，可能要 15-40 分钟）==="
           # ★ 用 pipefail 让 make 的失败退出码不被 tail 吞掉（否则假 success）
+          set +e
           set -o pipefail
-          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld vmlinux 2>&1 | tail -30
+          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld vmlinux 2>&1 | tee /tmp/vmlinux.log | tail -30
           VMLINUX_RC=${PIPESTATUS[0]}
+          set +o pipefail
           echo "=== vmlinux 编译退出码 = $VMLINUX_RC ==="
-          echo "=== 检查 Module.symvers (关键!) ==="
+          if [ $VMLINUX_RC -ne 0 ]; then
+            echo "❌ vmlinux 编译失败! 完整日志尾 120 行:"
+            tail -120 /tmp/vmlinux.log
+            exit 1
+          fi
+          echo "--- 当前目录符号表文件 ---"
+          ls -la *.symvers 2>/dev/null || echo "(无 *.symvers)"
+
+          # ★ vmlinux 只产出 vmlinux.symvers（内建符号）。
+          #  外部模块需要的 Module.symvers 必须靠 make modules 触发 MODPOST 汇总生成。
+          echo "=== ★ 编 modules 生成 Module.symvers（关键! 否则 .ko 符号无地址）==="
+          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld modules 2>&1 | tee /tmp/modules.log | tail -20
+          MODULES_RC=${PIPESTATUS[0]}
+          set -e
+          echo "=== modules 编译退出码 = $MODULES_RC ==="
+          echo "--- 符号表文件 ---"
+          ls -la Module.symvers vmlinux.symvers 2>/dev/null || true
           if [ ! -f Module.symvers ]; then
-            echo "❌ 致命: Module.symvers 未生成 (vmlinux_rc=$VMLINUX_RC)"
+            echo "❌ 致命: Module.symvers 仍未生成 (vmlinux_rc=$VMLINUX_RC modules_rc=$MODULES_RC)"
             echo "❌ 没有符号表 → 编出的 .ko 符号无地址 → insmod 必崩 → 终止!"
+            echo "--- modules 日志尾 60 行 ---"
+            tail -60 /tmp/modules.log
             exit 1
           fi
           echo "✅ Module.symvers 已生成, 行数: $(wc -l < Module.symvers)"
