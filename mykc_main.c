@@ -342,13 +342,14 @@ static unsigned long resolve_symbol(const char *name)
     return g_klookup(name);
 }
 
-/* ★ 用 kprobe 动态获取未导出符号地址(kallsyms_lookup_name 在 5.7+ 不再 EXPORT) */
-static unsigned long kprobe_lookup_name(const char *name)
+/* ★ 用 kprobe 动态获取未导出符号地址(kallsyms_lookup_name 在 5.7+ 不再 EXPORT)
+ *   注意: 函数名不能叫 kprobe_lookup_name —— 会和 <linux/kprobes.h> 里的内核函数撞车 */
+static unsigned long mykc_kprobe_lookup(const char *name)
 {
     struct kprobe kp;
     unsigned long addr = 0;
     memset(&kp, 0, sizeof(kp));
-    kp.symbol_name = "kallsyms_lookup_name";
+    kp.symbol_name = name;
     if (register_kprobe(&kp) == 0) {
         addr = (unsigned long)kp.addr;
         unregister_kprobe(&kp);
@@ -359,7 +360,7 @@ static unsigned long kprobe_lookup_name(const char *name)
 static void init_klookup(void)
 {
     /* 优先用 kprobe 拿 kallsyms_lookup_name 地址 */
-    g_klookup = (klookup_t)kprobe_lookup_name("kallsyms_lookup_name");
+    g_klookup = (klookup_t)mykc_kprobe_lookup("kallsyms_lookup_name");
     pr_info("kallsyms_lookup_name %savailable (via kprobe)\n", g_klookup ? "" : "NOT ");
 }
 
