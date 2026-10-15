@@ -81,6 +81,10 @@ jobs:
           set -e
           ./scripts/config --file .config -d MODULE_SIG_FORCE 2>/dev/null || true
           ./scripts/config --file .config -e MODULE_SIG 2>/dev/null || true
+          ./scripts/config --file .config -d MODVERSIONS 2>/dev/null || true
+          ./scripts/config --file .config -d MODULE_SIG 2>/dev/null || true
+          ./scripts/config --file .config -d MODULE_SIG_KEY 2>/dev/null || true
+          echo '=== B1: MODVERSIONS/MODULE_SIG 已关闭 ==='
           echo "=== olddefconfig ==="
           set +e
           make ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld olddefconfig > /tmp/olddef.log 2>&1
