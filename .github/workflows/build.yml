@@ -1,15 +1,12 @@
 name: Build MYKC Kernel Module
-
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
@@ -18,84 +15,64 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev kmod \
-            zip unzip python3 git make wget curl cpio
+            zip unzip python3 git make wget curl cpio xz-utils
           echo "=== 磁盘 ==="; df -h /
           echo "=== 内存 ==="; free -h
 
-      - name: 下载 Android clang 工具链
+      - name: 下载 Android clang 18 工具链 (锁定 r510928, 对齐设备内核)
         run: |
           mkdir -p $HOME/tc && cd $HOME/tc
-          echo "下载 prebuilt clang..."
-          git clone --depth 1 \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-            clang-tc 2>&1 | tail -3
-          CLANG=$(ls $HOME/tc/clang-tc/clang-r*/bin/clang 2>/dev/null | sort | tail -1)
-          if [ -z "$CLANG" ]; then
-            CLANG=$(find $HOME/tc/clang-tc -name clang -type f -path '*bin*' | head -1)
-          fi
+          echo "下载 prebuilt clang r510928 (clang 18.0.0)..."
+          # ★ 关键: 设备内核 .comment 显示 clang 18.0.0 (r510928)
+          #   KCFI typeid / MTE / 整体 ABI 都跟编译器版本强绑定,
+          #   用 clang 23 编出的模块在 clang 18 内核上加载 → kpanic
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r510928.tar.gz"
+          echo "URL=$URL"
+          curl -sL -m 900 -o clang18.tar.gz "$URL"
+          ls -la clang18.tar.gz
+          mkdir -p clang18 && tar xzf clang18.tar.gz -C clang18
+          CLANG=$HOME/tc/clang18/bin/clang
+          ls -la "$CLANG" || { echo "!! clang 不存在, 列目录:"; ls -la $HOME/tc/clang18 | head -20; exit 1; }
           CLANG_DIR=$(dirname "$CLANG")
           echo "CLANG_BIN=$CLANG" >> $GITHUB_ENV
           echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_ENV
           echo "$CLANG_DIR" >> $GITHUB_PATH
           echo "clang = $CLANG"
           echo "clang_dir = $CLANG_DIR"
-          $CLANG --version | head -2
-          echo "=== 检查 LLVM 链接器 ld.lld ==="
-          ls -la "$CLANG_DIR/ld.lld" || echo "!! ld.lld 缺失"
-          "$CLANG_DIR/ld.lld" --version 2>&1 | head -2 || true
-          echo "=== bin 目录关键工具 ==="
-          ls "$CLANG_DIR" | grep -E 'ld.lld|llvm-ar|llvm-objcopy|llvm-nm|llvm-strip' || true
+          $CLANG --version | head -3
+          "${CLANG_DIR}/ld.lld" --version 2>&1 | head -2 || true
 
-      - name: 下载 GKI 预编译内核产物 (KMI android15-6.6)
+      - name: 下载 GKI 源码树 (KMI android15-6.6)
         run: |
           cd $HOME
-          # 官方 GKI 源码树: 用 GitHub 镜像 (Actions 访问更稳, 避免 googlesource 抽风)
           echo "下载 GKI 源码树..."
           mkdir -p gki && cd gki
-
-          # ★ 关键: 用 GitHub 镜像 aosp-mirror/kernel_common, android15-6.6 分支
-          #   与设备内核同 KMI 分支 → 符号 CRC 稳定一致
           git clone --depth 1 -b android15-6.6 \
             https://github.com/aosp-mirror/kernel_common \
             common 2>&1 | tail -3
-
-          # 记录本树 commit, 便于核对
           git -C common log -1 --format='%H %s' 2>/dev/null | head -1
-
           cd common
-          echo "=== 检查是否含 Module.symvers ==="
-          ls -la Module.symvers 2>/dev/null || echo "无 Module.symvers(正常,浅克隆)"
-
           echo "=== 内核版本 ==="
           head -5 Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL'
-
           echo "KERNEL_DIR=$HOME/gki/common" >> $GITHUB_ENV
 
-      - name: 生成模块构建环境 (不需要编整个内核)
+      - name: 生成模块构建环境
         run: |
           cd ${{ env.KERNEL_DIR }}
           CLANG=${{ env.CLANG_BIN }}
           export PATH="${{ env.CLANG_DIR }}:$PATH"
           echo "PATH 前段 = $(echo $PATH | cut -d: -f1)"
           which ld.lld || echo "!! which ld.lld 失败"
-
-          echo "=== 生成 .config (用 gki_defconfig; device.config 与 AOSP 源码树不兼容) ==="
-          # ★ 注: 设备 /proc/config.gz 含厂商私有项, 与 AOSP kernel_common 源码树不兼容,
-          #   直接用会导致 vmlinux 编译失败(Makefile:1968 Error 2)。
-          #   正确做法: 用 gki_defconfig 编, 再靠 CFLAGS 补 BTI 属性对齐设备。
+          echo "=== 生成 .config (gki_defconfig) ==="
           set +e
           make ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld gki_defconfig > /tmp/defconfig.log 2>&1
           RC=$?
           echo "--- gki_defconfig 退出码 = $RC ---"
           tail -25 /tmp/defconfig.log
           if [ $RC -ne 0 ]; then
-            echo "❌ gki_defconfig 失败! 完整日志:"
-            cat /tmp/defconfig.log
-            exit 1
+            echo "❌ gki_defconfig 失败!"; cat /tmp/defconfig.log; exit 1
           fi
           set -e
-
-          # 关键: 允许未签名模块
           ./scripts/config --file .config -d MODULE_SIG_FORCE 2>/dev/null || true
           ./scripts/config --file .config -e MODULE_SIG 2>/dev/null || true
           echo "=== olddefconfig ==="
@@ -105,27 +82,20 @@ jobs:
           echo "--- olddefconfig 退出码 = $RC ---"
           tail -10 /tmp/olddef.log
           if [ $RC -ne 0 ]; then
-            echo "❌ olddefconfig 失败! 完整日志:"
-            cat /tmp/olddef.log
-            exit 1
+            echo "❌ olddefconfig 失败!"; cat /tmp/olddef.log; exit 1
           fi
           set -e
-
-          echo "=== modules_prepare (生成头文件 + 符号表) ==="
+          echo "=== modules_prepare ==="
           set +e
           make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld modules_prepare > /tmp/prep.log 2>&1
           RC=$?
           echo "--- modules_prepare 退出码 = $RC ---"
           tail -25 /tmp/prep.log
           if [ $RC -ne 0 ]; then
-            echo "❌ modules_prepare 失败! 完整日志(尾100行):"
-            tail -100 /tmp/prep.log
-            exit 1
+            echo "❌ modules_prepare 失败!"; tail -100 /tmp/prep.log; exit 1
           fi
           set -e
-
-          echo "=== ★ 编 vmlinux（关键步骤，可能要 15-40 分钟）==="
-          # ★ 用 pipefail 让 make 的失败退出码不被 tail 吞掉（否则假 success）
+          echo "=== 编 vmlinux ==="
           set +e
           set -o pipefail
           make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld vmlinux 2>&1 | tee /tmp/vmlinux.log | tail -30
@@ -133,45 +103,31 @@ jobs:
           set +o pipefail
           echo "=== vmlinux 编译退出码 = $VMLINUX_RC ==="
           if [ $VMLINUX_RC -ne 0 ]; then
-            echo "❌ vmlinux 编译失败! 完整日志尾 120 行:"
-            tail -120 /tmp/vmlinux.log
-            exit 1
+            echo "❌ vmlinux 编译失败!"; tail -120 /tmp/vmlinux.log; exit 1
           fi
-          echo "--- 当前目录符号表文件 ---"
-          ls -la *.symvers 2>/dev/null || echo "(无 *.symvers)"
-
-          # ★ vmlinux 只产出 vmlinux.symvers（内建符号）。
-          #  外部模块需要的 Module.symvers 必须靠 make modules 触发 MODPOST 汇总生成。
-          echo "=== ★ 编 modules 生成 Module.symvers（关键! 否则 .ko 符号无地址）==="
+          echo "=== 编 modules 生成 Module.symvers ==="
+          set +e
+          set -o pipefail
           make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld modules 2>&1 | tee /tmp/modules.log | tail -20
           MODULES_RC=${PIPESTATUS[0]}
+          set +o pipefail
           set -e
           echo "=== modules 编译退出码 = $MODULES_RC ==="
-          echo "--- 符号表文件 ---"
           ls -la Module.symvers vmlinux.symvers 2>/dev/null || true
           if [ ! -f Module.symvers ]; then
-            echo "❌ 致命: Module.symvers 仍未生成 (vmlinux_rc=$VMLINUX_RC modules_rc=$MODULES_RC)"
-            echo "❌ 没有符号表 → 编出的 .ko 符号无地址 → insmod 必崩 → 终止!"
-            echo "--- modules 日志尾 60 行 ---"
-            tail -60 /tmp/modules.log
-            exit 1
+            echo "❌ 致命: Module.symvers 未生成"; tail -60 /tmp/modules.log; exit 1
           fi
           echo "✅ Module.symvers 已生成, 行数: $(wc -l < Module.symvers)"
-          echo "--- 符号表前5行 ---"
-          head -5 Module.symvers
 
-      - name: 编译 mykc_core.ko
+      - name: 编译模块 (去掉 BTI, 对齐设备)
         run: |
           cd $GITHUB_WORKSPACE
           CLANG=${{ env.CLANG_BIN }}
           export PATH="${{ env.CLANG_DIR }}:$PATH"
-          echo "PATH 前段 = $(echo $PATH | cut -d: -f1)"
-          which ld.lld || echo "!! which ld.lld 仍失败"
           echo "=== 开始编译模块 ==="
-          # ★ 不再用 KBUILD_MODPOST_WARN=1 (禁止用警告兜底出半残 .ko)
-          # ★ 符号必须有地址, 否则 insmod 会 panic
-          # ★ 用 pipefail 让 make 的失败退出码不被 tail 吞掉
-          # ★ 设备开了 ARM64_BTI + CFI_CLANG, 模块必须带 bti 属性, 否则 insmod ENOEXEC!
+          # ★ 关键修复: 设备 CONFIG_ARM64_BTI_KERNEL 未设,
+          #   原厂模块 .note.gnu.property = 0x02 (仅 PAC),
+          #   用 -mbranch-protection=standard 会产生 0x04 (BTI) → 加载失败
           set -o pipefail
           make -C ${{ env.KERNEL_DIR }} \
             M=$GITHUB_WORKSPACE \
@@ -179,76 +135,62 @@ jobs:
             CC=$CLANG \
             LLVM=1 \
             LD=ld.lld \
-            CFLAGS_MODULE="-mbranch-protection=standard" \
+            CFLAGS_MODULE="-mbranch-protection=pac-ret" \
             modules 2>&1 | tail -80
           MAKE_RC=${PIPESTATUS[0]}
           echo "make 退出码 = $MAKE_RC"
           echo "=== 编译产物 ==="
           ls -la *.ko 2>/dev/null || echo "!! 无 .ko 产出"
           if [ ! -f mykc_core.ko ]; then
-            echo "❌ 编译未产出 mykc_core.ko (make_rc=$MAKE_RC)"
-            exit 1
+            echo "❌ 编译未产出 mykc_core.ko (make_rc=$MAKE_RC)"; exit 1
           fi
           if [ "$MAKE_RC" != "0" ]; then
-            echo "❌ make 返回非零 ($MAKE_RC) → 有未解析符号 → 终止!"
-            exit 1
+            echo "❌ make 返回非零 ($MAKE_RC)"; exit 1
           fi
-          echo "✅ 编译成功产出 mykc_core.ko (符号全解析)"
+          echo "✅ 编译成功"
 
-      - name: 校验符号表 (查未导出符号 UND)
+      - name: 校验符号表
         run: |
           cd $GITHUB_WORKSPACE
-          echo "=== 1. 检查是否有未导出符号引用 (会导致 insmod Unknown symbol) ==="
-          BAD=$(llvm-nm -u mykc_core.ko 2>/dev/null | awk '{print $2}' | grep -E '^(kallsyms_lookup_name|_text)$' || true)
-          if [ -n "$BAD" ]; then
-            echo "!! 发现未导出符号引用:"; echo "$BAD"
-            echo "!! 这些符号内核不 EXPORT, insmod 会失败"
-          else
-            echo "OK: 无 kallsyms_lookup_name / _text 的 UND 引用"
-          fi
-          echo "=== 2. 完整 UND 符号列表(供核对) ==="
+          echo "=== UND 符号检查 ==="
           llvm-nm -u mykc_core.ko 2>/dev/null | head -60 || nm -u mykc_core.ko | head -60
 
-      - name: 校验并修正 vermagic (对齐设备内核)
+      - name: 校验并修正 vermagic + CRC (所有 .ko)
         run: |
           cd $GITHUB_WORKSPACE
-          # ★ 设备真实 vermagic 前缀 (小米 K80 Pro / 6.6.118 GKI)
-          #   设备: 6.6.118-android15-8-gc44b714366cc-abogki519650608-4k
           TARGET_VER="6.6.118-android15-8-gc44b714366cc-abogki519650608-4k"
-          echo "=== 修正前 vermagic ==="
-          modinfo mykc_core.ko 2>/dev/null | grep vermagic || echo "(modinfo 无输出)"
-          echo "=== 运行 patch_vermagic.py ==="
-          python3 patch_vermagic.py mykc_core.ko mykc_core.patched.ko "$TARGET_VER" 2>&1 | tail -20
-          if [ -f mykc_core.patched.ko ]; then
-            mv mykc_core.patched.ko mykc_core.ko
-            echo "=== 修正后 vermagic ==="
-            modinfo mykc_core.ko 2>/dev/null | grep -E 'vermagic|name|license'
-            echo "=== ELF 结构校验 (error 数应为 0) ==="
-            readelf -S mykc_core.ko 2>&1 | grep -c Error || true
-          else
-            echo "!! patch 失败, 保留原始 .ko"
-          fi
+          echo "=== 修正前 ==="
+          for f in *.ko; do
+            echo "--- $f ---"
+            modinfo $f 2>/dev/null | grep -E 'vermagic|name' || true
+          done
+          # ★ 修复: 遍历所有 .ko 一起 patch (原版只处理 mykc_core.ko)
+          for f in *.ko; do
+            echo "=== patch vermagic: $f ==="
+            python3 patch_vermagic.py "$f" "${f%.ko}_vt.ko" "$TARGET_VER" || echo "(patch 失败: $f)"
+            if [ -f "${f%.ko}_vt.ko" ]; then
+              mv "${f%.ko}_vt.ko" "$f"
+            fi
+          done
+          echo "=== 修正后 ==="
+          for f in *.ko; do
+            echo "--- $f ---"
+            modinfo $f 2>/dev/null | grep -E 'vermagic|name' || true
+          done
 
-      - name: 收集产物
+      - name: 校验 gnu.property (确认无 BTI)
         run: |
           cd $GITHUB_WORKSPACE
-          if [ ! -f mykc_core.ko ]; then
-            echo "❌ 编译失败，未产出 mykc_core.ko"
-            ls -la *.o *.ko 2>/dev/null
-            exit 1
-          fi
-          echo "=== ✅ 产物 ==="
-          ls -la mykc_core.ko
-          file mykc_core.ko
-          sha256sum mykc_core.ko
-          echo "=== ✅ 对照模块 (hello_min) ==="
-          ls -la hello_min.ko 2>/dev/null && sha256sum hello_min.ko || echo "!! hello_min.ko 未产出"
+          for f in *.ko; do
+            echo "--- $f ---"
+            readelf -n $f 2>/dev/null | grep -A2 'gnu.property' || true
+          done
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: mykc-module
           path: |
-            mykc_core.ko
-            hello_min.ko
-          retention-days: 30
+            *.ko
+            patch_vermagic.py
+          if-no-files-found: error
