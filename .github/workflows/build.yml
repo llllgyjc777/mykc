@@ -49,15 +49,18 @@ jobs:
       - name: 下载 GKI 预编译内核产物 (KMI android15-6.6)
         run: |
           cd $HOME
-          # 官方 GKI 预编译: 含 vmlinux + Module.symvers + headers，不用编内核
-          echo "尝试下载 GKI 预编译包..."
+          # 官方 GKI 源码树: 用 GitHub 镜像 (Actions 访问更稳, 避免 googlesource 抽风)
+          echo "下载 GKI 源码树..."
           mkdir -p gki && cd gki
 
-          # 方式: 从 kernel/common 分支直接拉构建产物
-          # Google 提供 prebuilt KMI 在 android.googlesource.com 的特定 tag
+          # ★ 关键: 用 GitHub 镜像 aosp-mirror/kernel_common, android15-6.6 分支
+          #   与设备内核同 KMI 分支 → 符号 CRC 稳定一致
           git clone --depth 1 -b android15-6.6 \
-            https://android.googlesource.com/kernel/common \
+            https://github.com/aosp-mirror/kernel_common \
             common 2>&1 | tail -3
+
+          # 记录本树 commit, 便于核对
+          git -C common log -1 --format='%H %s' 2>/dev/null | head -1
 
           cd common
           echo "=== 检查是否含 Module.symvers ==="
