@@ -105,6 +105,8 @@ jobs:
           which ld.lld || echo "!! which ld.lld 仍失败"
           echo "=== 开始编译模块 ==="
           # KBUILD_MODPOST_WARN=1: 未解析符号降级为警告，保证出 .ko
+          # ★ 用 pipefail 让 make 的失败退出码不被 tail 吞掉
+          set -o pipefail
           make -C ${{ env.KERNEL_DIR }} \
             M=$GITHUB_WORKSPACE \
             ARCH=arm64 \
@@ -112,9 +114,16 @@ jobs:
             LLVM=1 \
             LD=ld.lld \
             KBUILD_MODPOST_WARN=1 \
-            modules 2>&1 | tail -60
+            modules 2>&1 | tail -80
+          MAKE_RC=${PIPESTATUS[0]}
+          echo "make 退出码 = $MAKE_RC"
           echo "=== 编译产物 ==="
           ls -la *.ko 2>/dev/null || echo "!! 无 .ko 产出"
+          if [ ! -f mykc_core.ko ]; then
+            echo "❌ 编译未产出 mykc_core.ko (make_rc=$MAKE_RC)"
+            exit 1
+          fi
+          echo "✅ 编译成功产出 mykc_core.ko"
 
       - name: 校验符号表 (查未导出符号 UND)
         run: |
