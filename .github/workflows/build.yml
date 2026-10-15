@@ -80,15 +80,47 @@ jobs:
           which ld.lld || echo "!! which ld.lld 失败"
 
           echo "=== 用 gki_defconfig 生成 .config ==="
-          make ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld gki_defconfig 2>&1 | tail -5
+          # ★ 不吞输出: 全量写日志文件 + 显示退出码
+          set +e
+          make ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld gki_defconfig > /tmp/defconfig.log 2>&1
+          RC=$?
+          echo "--- gki_defconfig 退出码 = $RC ---"
+          tail -25 /tmp/defconfig.log
+          if [ $RC -ne 0 ]; then
+            echo "❌ gki_defconfig 失败! 完整日志:"
+            cat /tmp/defconfig.log
+            exit 1
+          fi
+          set -e
 
           # 关键: 允许未签名模块
           ./scripts/config --file .config -d MODULE_SIG_FORCE 2>/dev/null || true
           ./scripts/config --file .config -e MODULE_SIG 2>/dev/null || true
-          make ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld olddefconfig 2>&1 | tail -3
+          echo "=== olddefconfig ==="
+          set +e
+          make ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld olddefconfig > /tmp/olddef.log 2>&1
+          RC=$?
+          echo "--- olddefconfig 退出码 = $RC ---"
+          tail -10 /tmp/olddef.log
+          if [ $RC -ne 0 ]; then
+            echo "❌ olddefconfig 失败! 完整日志:"
+            cat /tmp/olddef.log
+            exit 1
+          fi
+          set -e
 
           echo "=== modules_prepare (生成头文件 + 符号表) ==="
-          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld modules_prepare 2>&1 | tail -15
+          set +e
+          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 LD=ld.lld modules_prepare > /tmp/prep.log 2>&1
+          RC=$?
+          echo "--- modules_prepare 退出码 = $RC ---"
+          tail -25 /tmp/prep.log
+          if [ $RC -ne 0 ]; then
+            echo "❌ modules_prepare 失败! 完整日志(尾100行):"
+            tail -100 /tmp/prep.log
+            exit 1
+          fi
+          set -e
 
           echo "=== ★ 编 vmlinux 生成 Module.symvers（关键步骤，可能要 30-60 分钟）==="
           # ★ 用 pipefail 让 make 的失败退出码不被 tail 吞掉（否则假 success）
