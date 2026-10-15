@@ -25,6 +25,7 @@
 #include <linux/pid_namespace.h>
 #include <linux/string.h>
 #include <linux/math64.h>
+#include <linux/jiffies.h>
 
 #include "mykc.h"
 
@@ -329,20 +330,21 @@ static u64 esp_find_cam(struct mm_struct *mm, u64 arr, int n, u64 *out_self)
 /* =====================================================================
  *  ★ 队友过滤
  * ===================================================================== */
-/* 读自身队伍ID：self_actor + 0x0B78 */
+/* 读自身队伍ID：self_actor + 0x0B78
+ * ★ 经验(EspX 实测)：队伍ID 一局内不变 → 一旦锁定就不再改，
+ *   否则敌人近身/相机宿主跳变时会把敌人队伍ID 污染成"自己队"
+ */
 static void esp_update_self_team(struct mm_struct *mm)
 {
     u32 t = 0;
-
-    g_esp.self_team_valid = 0;
+    /* ★ 已锁定 → 直接保持，绝不重读（一局内队伍不变） */
+    if (g_esp.self_team_valid) return;
     if (!g_esp.cached_self_actor) return;
 
     if (!esp_read(mm, g_esp.cached_self_actor + OFF_ACTOR_TEAM, &t, 4))
         return;
-
-    /* 合理性校验：队伍ID 一般在 0~100 之间，且不能是 0xFFFFFFFF 这种垃圾 */
+    /* 合理性校验：队伍ID 一般在 0~1000 之间，且不能是 0xFFFFFFFF 这种垃圾 */
     if (t == 0xFFFFFFFFu || t > 1000u) return;
-
     g_esp.self_team = t;
     g_esp.self_team_valid = 1;
 }
@@ -381,26 +383,44 @@ static void esp_cls_add(u64 cls)
     }
 }
 
-/* 选最可能的人类类 */
+/* ★ 选最可能的人类类（命中率评分 + hp命中率硬门槛）
+ * 经验(已在 EspX 实测验证)：
+ *   大类(模型/载具/物资, cnt=40+) 靠"对象多"刷 hp 命中绝对数 → 会压制真玩家类
+ *   修复: 改用"命中率(%)"，并要求 hp 命中率 >= 50% 才有资格当玩家类
+ */
 static u64 esp_pick_player_cls(struct mm_struct *mm, u64 arr, int n)
 {
-    int i, best = -1, best_hits = -1;
-
+    int i, best = -1, best_score = -1;
     for (i = 0; i < g_esp.cls_count; i++) {
-        int hits = 0, valid = 0, k;
+        int h60 = 0, h68 = 0, hxy = 0, valid = 0, k;
+        int rate60, rate68, rateXY, score;
 
-        if (g_esp.classes[i].cnt < 3 || g_esp.classes[i].cnt > 200) continue;
-
+        if (g_esp.classes[i].cnt < 2 || g_esp.classes[i].cnt > 200) continue;
         for (k = 0; k < n && valid < 60 && k < MAX_ITER; k++) {
             u64 a = esp_rp(mm, arr + (u64)k * 8);
-            float h;
+            u64 root;
+            float h, hm, wx, wy;
             if (!esp_readable(mm, a)) continue;
             if (esp_rp(mm, a + OFF_ACTOR_CLS) != g_esp.classes[i].cls) continue;
             valid++;
-            h = esp_rf(mm, a + OFF_ACTOR_HP);
-            if (h >= 1.0f && h <= 100.0f) hits++;
+            h = esp_rf(mm, a + OFF_ACTOR_HP);          /* hp @ 0x1060 */
+            if (h >= 1.0f && h <= 100.0f) h60++;
+            hm = esp_rf(mm, a + OFF_ACTOR_MAXHP);       /* hpmax @ 0x1068 */
+            if (hm >= 1.0f && hm <= 100.0f) h68++;
+            root = esp_rp(mm, a + OFF_ACTOR_ROOT);
+            if (esp_readable(mm, root)) {
+                wx = esp_rf(mm, root + OFF_ROOT_POS);
+                wy = esp_rf(mm, root + OFF_ROOT_POS + 4);
+                if (wx > 1e5f && wx < 1.5e6f && wy > 1e5f && wy < 1.5e6f) hxy++;
+            }
         }
-        if (hits > best_hits) { best_hits = hits; best = i; }
+        if (valid < 2) continue;
+        rate60 = h60 * 100 / valid;      /* hp 命中率 0~100 */
+        rate68 = h68 * 100 / valid;
+        rateXY = hxy * 100 / valid;
+        if (rate60 < 50) continue;       /* ★ 硬门槛: hp 命中率必须 >= 50% */
+        score = rate60 * 10 + rate68 * 4 + rateXY;   /* 命中率为主, 权重向 hp 倾斜 */
+        if (score > best_score) { best_score = score; best = i; }
     }
     return (best >= 0) ? g_esp.classes[best].cls : 0;
 }
@@ -477,12 +497,19 @@ static int esp_scan_frame(struct mm_struct *mm, struct mykc_espframe *out)
         if (hp <= 0.0f || hp > 100.0f) continue;
 
 #if MYKC_ESP_DBG_TEAM
+        /* ★ 节流: 每 2 秒最多打印一次(避免 pr_info 刷屏拖垮内核日志/帧率)
+         *   经验(EspX 实测): 每帧 stderr 刷屏 → IO 阻塞 → 进程卡死
+         */
         {
-            u32 dbg_team = esp_ru32(mm, a + OFF_ACTOR_TEAM);
+            static unsigned long last_dbg_jiffies = 0;
+            if (jiffies - last_dbg_jiffies >= 2 * HZ) {
+                last_dbg_jiffies = jiffies;
+                u32 dbg_team = esp_ru32(mm, a + OFF_ACTOR_TEAM);
             u32 dbg_bot  = esp_ru32(mm, a + OFF_ACTOR_BOT);
             pr_info("actor=%llx hp=%.0f team=0x%x bot=0x%x self=%d(my_team=0x%x)\n",
                     (unsigned long long)a, hp, dbg_team, dbg_bot,
                     g_esp.self_team_valid, g_esp.self_team);
+            }
         }
 #endif
 
