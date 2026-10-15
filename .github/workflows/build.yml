@@ -241,10 +241,14 @@ jobs:
           ls -la mykc_core.ko
           file mykc_core.ko
           sha256sum mykc_core.ko
+          echo "=== ✅ 对照模块 (hello_min) ==="
+          ls -la hello_min.ko 2>/dev/null && sha256sum hello_min.ko || echo "!! hello_min.ko 未产出"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: mykc-module
-          path: mykc_core.ko
+          path: |
+            mykc_core.ko
+            hello_min.ko
           retention-days: 30
