@@ -99,27 +99,22 @@ jobs:
           ls -la *.ko 2>/dev/null || echo "!! 无 .ko 产出"
           modinfo mykc_core.ko 2>/dev/null | head -10 || true
 
-      - name: 生成自释放脚本
+      - name: 收集产物
         run: |
           cd $GITHUB_WORKSPACE
           if [ ! -f mykc_core.ko ]; then
             echo "❌ 编译失败，未产出 mykc_core.ko"
-            echo "--- 列出所有 .o 看线索 ---"
             ls -la *.o *.ko 2>/dev/null
             exit 1
           fi
+          echo "=== ✅ 产物 ==="
           ls -la mykc_core.ko
+          file mykc_core.ko
+          sha256sum mykc_core.ko
 
-          printf '#!/bin/sh\n# mykc self-extract + insmod\nset -e\nTMP=$(mktemp)\ntrap "rm -f \\"$TMP\\"" EXIT INT TERM\nbase64 -d <<'"'"'__MYKC_KO__'"'"' > "$TMP"\n' > mykc.ko.sh
-          base64 mykc_core.ko >> mykc.ko.sh
-          printf '__MYKC_KO__\ninsmod "$TMP"\nif [ $? -eq 0 ]; then echo "mykc loaded OK"; else echo "FAILED"; exit 1; fi\n' >> mykc.ko.sh
-          chmod 755 mykc.ko.sh
-          echo "打包完成: $(wc -c < mykc.ko.sh) bytes"
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
           name: mykc-module
-          path: |
-            mykc_core.ko
-            mykc.ko.sh
+          path: mykc_core.ko
           retention-days: 30
