@@ -23,16 +23,22 @@ jobs:
         run: |
           mkdir -p $HOME/tc && cd $HOME/tc
           echo "下载 prebuilt clang r510928 (clang 18.0.0)..."
-          # ★ 关键: 设备内核 .comment 显示 clang 18.0.0 (r510928)
-          #   KCFI typeid / MTE / 整体 ABI 都跟编译器版本强绑定,
-          #   用 clang 23 编出的模块在 clang 18 内核上加载 → kpanic
-          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r510928.tar.gz"
+          # ★ 探针实测: main 分支无此目录(404),
+          #   tag android-15.0.0_r1 存在(clang-r510928?format=TEXT => 200)
+          #   +archive 语法可下到真 gzip (探针已验: gzip compressed data)
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/tags/android-15.0.0_r1/clang-r510928.tar.gz"
           echo "URL=$URL"
           curl -sL -m 900 -o clang18.tar.gz "$URL"
           ls -la clang18.tar.gz
+          echo "=== 文件类型 ==="
+          file clang18.tar.gz
           mkdir -p clang18 && tar xzf clang18.tar.gz -C clang18
+          echo "=== 解压后顶层 ==="
+          ls -la $HOME/tc/clang18 | head -20
           CLANG=$HOME/tc/clang18/bin/clang
-          ls -la "$CLANG" || { echo "!! clang 不存在, 列目录:"; ls -la $HOME/tc/clang18 | head -20; exit 1; }
+          if [ ! -x "$CLANG" ]; then
+            echo "!! bin/clang 不存在, 尝试找 clang 可执行:"; find $HOME/tc/clang18 -maxdepth 3 -name 'clang' -type f | head -10; exit 1
+          fi
           CLANG_DIR=$(dirname "$CLANG")
           echo "CLANG_BIN=$CLANG" >> $GITHUB_ENV
           echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_ENV
