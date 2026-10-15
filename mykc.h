@@ -100,11 +100,12 @@ struct mykc_espcfg {
 };
 
 /* ---------- v2: 方框 ---------- */
+/* ★ 内核禁浮点: 全部用 s32。坐标=像素; dist=米; hp=值×100 */
 #define MYKC_BOX_MAX      64
 struct mykc_box {
-    float  x0, y0, x1, y1;  /* 屏幕坐标（像素） */
-    float  dist;            /* 距离（米） */
-    float  hp;              /* 血量 */
+    __s32  x0, y0, x1, y1;  /* 屏幕坐标（像素，整数） */
+    __s32  dist;            /* 距离（米） */
+    __s32  hp;              /* 血量 ×100 */
     __u32  flags;           /* MYKC_BOX_* */
 };
 #define MYKC_BOX_VISIBLE    0x0001
