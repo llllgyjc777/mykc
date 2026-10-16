@@ -184,7 +184,8 @@ jobs:
               LLVM=1 \
               KBUILD_MODPOST_WARN=1 \
               KCFLAGS="-fsanitize=kcfi -Wno-unused-command-line-argument" \
-              modules 2>&1 | grep -aE 'clang|error|warning|CC \[M\]|\.o' | tail -60
+              V=1 \
+              modules > /tmp/build.log 2>&1 || true
           else
             make -C ${{ env.KERNEL_DIR }} \
               M=$GITHUB_WORKSPACE \
@@ -193,8 +194,22 @@ jobs:
               LD=ld.lld \
               LLVM=1 \
               KBUILD_MODPOST_WARN=1 \
-              modules 2>&1 | tail -40
+              V=1 \
+              modules > /tmp/build.log 2>&1 || true
           fi
+
+          echo "===== BUILD LOG SIZE ====="
+          wc -l /tmp/build.log || true
+          echo "===== ★ 真实 clang 命令行 (前 3 条完整行) ====="
+          grep -aE '(clang|cc1).*-c ' /tmp/build.log | head -3 || echo "(未抓到 clang 命令行)"
+          echo "===== ★ 所有含 sanitize 的行 ====="
+          grep -a 'sanitize' /tmp/build.log | head -20 || echo "(build.log 中无 sanitize 字样)"
+          echo "===== ★ KCFLAGS 是否出现在命令行 ====="
+          grep -a 'KCFLAGS\|-fsanitize=kcfi' /tmp/build.log | head -10 || echo "(命令行未含 -fsanitize=kcfi)"
+          echo "===== 编译错误/警告 (前 40 行) ====="
+          grep -aE 'error|Error|warning:' /tmp/build.log | head -40 || echo "(无 error/warning)"
+          echo "===== 日志尾部 30 行 ====="
+          tail -30 /tmp/build.log || true
 
           echo "=== 产物 ==="
           ls -la *.ko 2>/dev/null || { echo "!! 无 .ko 产出"; exit 1; }
