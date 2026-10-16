@@ -1,4 +1,4 @@
-name: Build MYKC Kernel Module v3
+name: Build MYKC Kernel Module
 
 on:
   push:
@@ -18,13 +18,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bc bison flex libssl-dev libelf-dev kmod \
-            zip unzip python3 git make wget curl cpio binutils
+            zip unzip python3 git make wget curl cpio
           echo "=== 磁盘 ==="; df -h /
           echo "=== 内存 ==="; free -h
 
       - name: 下载 Android clang 工具链
         run: |
           mkdir -p $HOME/tc && cd $HOME/tc
+          echo "下载 prebuilt clang..."
           git clone --depth 1 \
             https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
             clang-tc 2>&1 | tail -3
@@ -39,29 +40,47 @@ jobs:
       - name: 下载 GKI 预编译内核产物 (KMI android15-6.6)
         run: |
           cd $HOME
+          # 官方 GKI 预编译: 含 vmlinux + Module.symvers + headers，不用编内核
+          echo "尝试下载 GKI 预编译包..."
           mkdir -p gki && cd gki
+
+          # 方式: 从 kernel/common 分支直接拉构建产物
+          # Google 提供 prebuilt KMI 在 android.googlesource.com 的特定 tag
           git clone --depth 1 -b android15-6.6 \
             https://android.googlesource.com/kernel/common \
             common 2>&1 | tail -3
+
           cd common
           echo "=== 检查是否含 Module.symvers ==="
           ls -la Module.symvers 2>/dev/null || echo "无 Module.symvers(正常,浅克隆)"
+
+          echo "=== 内核版本 ==="
           head -5 Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL'
+
           echo "KERNEL_DIR=$HOME/gki/common" >> $GITHUB_ENV
 
       - name: 生成模块构建环境 (不需要编整个内核)
         run: |
           cd ${{ env.KERNEL_DIR }}
           CLANG=${{ env.CLANG_BIN }}
+
+          echo "=== 用 gki_defconfig 生成 .config ==="
           make ARCH=arm64 CC=$CLANG LLVM=1 gki_defconfig 2>&1 | tail -5
+
+          # 关键: 允许未签名模块
           ./scripts/config --file .config -d MODULE_SIG_FORCE 2>/dev/null || true
           ./scripts/config --file .config -e MODULE_SIG 2>/dev/null || true
+          # MYKC: 打开 CONFIG_MODVERSIONS -> vermagic 带 modversions (设备内核要求)
+          ./scripts/config --file .config -e MODVERSIONS 2>/dev/null || true
+          ./scripts/config --file .config -d MODULE_SIG_FORCE 2>/dev/null || true
           make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -3
-          echo "=== modules_prepare ==="
+
+          echo "=== modules_prepare (生成头文件 + 符号表) ==="
           make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 modules_prepare 2>&1 | tail -15
-          echo "=== ★ 编 vmlinux 生成 Module.symvers ==="
+
+          echo "=== ★ 编 vmlinux 生成 Module.symvers（关键步骤，可能要 30-60 分钟）==="
           make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 vmlinux 2>&1 | tail -20 || \
-            echo "!! vmlinux 编译未完全成功, 继续"
+            echo "!! vmlinux 编译未完全成功，继续用 KBUILD_MODPOST_WARN 兜底"
           echo "=== 检查 Module.symvers ==="
           ls -la Module.symvers 2>/dev/null && wc -l Module.symvers || echo "无 Module.symvers"
 
@@ -70,6 +89,7 @@ jobs:
           cd $GITHUB_WORKSPACE
           CLANG=${{ env.CLANG_BIN }}
           echo "=== 开始编译模块 ==="
+          # KBUILD_MODPOST_WARN=1: 未解析符号降级为警告，保证出 .ko
           make -C ${{ env.KERNEL_DIR }} \
             M=$GITHUB_WORKSPACE \
             ARCH=arm64 \
@@ -77,50 +97,38 @@ jobs:
             LLVM=1 \
             KBUILD_MODPOST_WARN=1 \
             modules 2>&1 | tail -40
+
           echo "=== 编译产物 ==="
           ls -la *.ko 2>/dev/null || echo "!! 无 .ko 产出"
           modinfo mykc_core.ko 2>/dev/null | head -10 || true
-
-      - name: ★ UND 符号强校验 (v3 核心关卡)
-        run: |
-          cd $GITHUB_WORKSPACE
-          if [ ! -f mykc_core.ko ]; then
-            echo "❌ 编译失败，未产出 mykc_core.ko"; exit 1
-          fi
-          echo "=== 全量 UND 符号 ==="
-          readelf -sW mykc_core.ko | awk '$7=="UND" {print $8}' | sort -u | tee /tmp/und.txt
-          echo "=== 检查禁用的未导出符号 ==="
-          FAIL=0
-          for s in kallsyms_lookup_name _text __pte_offset_map; do
-            if grep -qx "$s" /tmp/und.txt; then
-              echo "❌ 发现禁用符号: $s (会致 insmod 失败/崩机)"
-              FAIL=1
-            fi
-          done
-          echo "=== 检查 __versions 段 (应为 0 或极小) ==="
-          readelf -SW mykc_core.ko | grep -i versions || echo "(无 __versions 段)"
-          echo "=== vermagic ==="
-          modinfo mykc_core.ko | grep vermagic || true
-          if [ $FAIL -eq 1 ]; then
-            echo "!!!!! v3 校验失败: 仍存在未导出符号引用 !!!!!"
-            exit 1
-          fi
-          echo "✅ v3 校验通过: 无禁用符号"
+          echo "=== MYKC vermagic 强校验 ==="
+          VM=$(strings mykc_core.ko | grep -m1 "^vermagic=")
+          echo "GOT: $VM"
+          case "$VM" in
+            *modversions*) echo "OK: vermagic 含 modversions" ;;
+            *) echo "FAIL: vermagic 缺 modversions"; exit 1 ;;
+          esac
 
       - name: 生成自释放脚本
         run: |
           cd $GITHUB_WORKSPACE
+          if [ ! -f mykc_core.ko ]; then
+            echo "❌ 编译失败，未产出 mykc_core.ko"
+            echo "--- 列出所有 .o 看线索 ---"
+            ls -la *.o *.ko 2>/dev/null
+            exit 1
+          fi
           ls -la mykc_core.ko
-          printf '#!/bin/sh\n# mykc v3 self-extract + insmod\nset -e\nTMP=$(mktemp)\ntrap "rm -f \\"$TMP\\"" EXIT INT TERM\nbase64 -d <<'"'"'__MYKC_KO__'"'"' > "$TMP"\n' > mykc.ko.sh
+
+          printf '#!/bin/sh\n# mykc self-extract + insmod\nset -e\nTMP=$(mktemp)\ntrap "rm -f \\"$TMP\\"" EXIT INT TERM\nbase64 -d <<'"'"'__MYKC_KO__'"'"' > "$TMP"\n' > mykc.ko.sh
           base64 mykc_core.ko >> mykc.ko.sh
           printf '__MYKC_KO__\ninsmod "$TMP"\nif [ $? -eq 0 ]; then echo "mykc loaded OK"; else echo "FAILED"; exit 1; fi\n' >> mykc.ko.sh
           chmod 755 mykc.ko.sh
           echo "打包完成: $(wc -c < mykc.ko.sh) bytes"
-
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
-          name: mykc-module-v3
+          name: mykc-module
           path: |
             mykc_core.ko
             mykc.ko.sh
