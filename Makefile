@@ -8,7 +8,8 @@
 obj-m += mykc_core.o
 mykc_core-objs := mykc_main.o mykc_esp.o
 # ★ 对照实验用最小模块（验证编译环境是否能产出可 insmod 的 .ko）
-obj-m += hello_min.o
+#   2026-10-16: 暂时关掉, 避免干扰主产物; 需要时再打开
+# obj-m += hello_min.o
 # 说明: mykc_main.c 是主体(ioctl/内存引擎), mykc_esp.c 是 ESP 引擎
 #       二者一起链接成单个 mykc_core.ko
 #       注意: 主体文件必须叫 mykc_main.c（不能叫 mykc_core.c，否则和 obj-m 冲突）
@@ -23,7 +24,22 @@ LD              ?= ld.lld
 LLVM            ?= $(HOME)/toolchains/clang/bin
 
 # GKI 内核编译必须参数
+#
+# ★★★ 路线 B 核心 (2026-10-16): 必须开 kCFI ★★★
+#   设备内核 CONFIG_CFI_CLANG=y 且 CFI_PERMISSIVE 未开 => 严格模式。
+#   不生成 __kcfi_typeid_* 的模块 => 间接调用被 check_cfi 拦 => BUG => 秒重启。
+#   (对照 paradise66.ko: 它有 28 个 __kcfi_typeid_* 符号 => 能活)
+#
+#   两种传法同时上(冗余保险):
+#     1) workflow 的 make 命令行传 KCFLAGS="-fsanitize=kcfi"
+#     2) 这里在 ccflags-y 里也加一份
+#
+#   -fno-sanitize-cfi-canonical-jump-tables: GKI 常用, 避免跳转表 canonical 化
 EXTRA_CFLAGS := -Wno-unused-variable -Wno-unused-function -Wno-format
+
+# 模块级 flag (ccflags-y 对这个 obj-m 下所有 .c 生效)
+ccflags-y += -fsanitize=kcfi
+ccflags-y += -fno-sanitize-cfi-canonical-jump-tables
 
 all:
 	@echo "=== 编译 mykc_core.ko ==="

@@ -99,14 +99,25 @@ jobs:
           # ★ 把 LOCALVERSION 对齐设备内核, 让 vermagic 第一段也一致 (双保险)
           ./scripts/config --file .config --set-str LOCALVERSION "-android15-8-gc44b714366cc-abogki519650608-4k" 2>/dev/null || true
           ./scripts/config --file .config -d LOCALVERSION_AUTO 2>/dev/null || true
-
+          # ★★★ 路线 B 核心: 强制开启 CFI_CLANG (设备内核 CONFIG_CFI_CLANG=y 严格模式)
+          #   不开 CFI 的模块没有 __kcfi_typeid_* 符号 => 间接调用被内核 check_cfi 拦 => BUG => 秒重启
+          ./scripts/config --file .config -e CFI_CLANG 2>/dev/null || true
+          ./scripts/config --file .config -d CFI_PERMISSIVE 2>/dev/null || true
+          ./scripts/config --file .config -e CFI_ICALL_NORMALIZE_INTEGERS 2>/dev/null || true
           make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -3
-
           echo "=== .config 关键项自检 ==="
           grep -E '^CONFIG_(MODVERSIONS|MODULE_SIG|MODULE_SIG_FORCE|LOCALVERSION)' .config || true
+          grep -E '^CONFIG_(CFI_CLANG|CFI_PERMISSIVE|SHADOW_CALL_STACK|ARM64_PTR_AUTH_KERNEL)' .config || true
           if ! grep -q '^CONFIG_MODVERSIONS=y' .config; then
             echo "!! CONFIG_MODVERSIONS 未生效, 中止"; exit 1
           fi
+          if ! grep -q '^CONFIG_CFI_CLANG=y' .config; then
+            echo "!! 警告: CONFIG_CFI_CLANG 未生效 (继续, 但产物可能再次崩机)"
+          else
+            echo "OK: CONFIG_CFI_CLANG=y 已开启"
+          fi
+          # ★ CFI 需要 LTO 才能生成完整 typeid 表? GKI 用 ThinLTO; 这里不强开, 保持 gki 默认
+          grep -E '^CONFIG_(LTO|LTO_CLANG)' .config || true
 
           echo "=== modules_prepare (只需头文件, 不编 vmlinux) ==="
           make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 modules_prepare 2>&1 | tail -10
@@ -127,7 +138,10 @@ jobs:
           echo "=== PATH 自检 ==="
           which ld.lld || echo "!! ld.lld 不在 PATH"
 
-          echo "=== 编译模块 ==="
+          echo "=== 编译模块 (★ 显式开启 kCFI) ==="
+          # ★★★ 路线 B 核心: 外部模块编译必须显式传 -fsanitize=kcfi,
+          #   否则产物没有 __kcfi_typeid_* 段 => 内核 check_cfi 拦截 => BUG => 秒重启
+          #   设备内核: CONFIG_CFI_CLANG=y + CFI_PERMISSIVE 未开 (严格模式)
           make -C ${{ env.KERNEL_DIR }} \
             M=$GITHUB_WORKSPACE \
             ARCH=arm64 \
@@ -135,6 +149,7 @@ jobs:
             LD=ld.lld \
             LLVM=1 \
             KBUILD_MODPOST_WARN=1 \
+            KCFLAGS="-fsanitize=kcfi" \
             modules 2>&1 | tail -40
 
           echo "=== 产物 ==="
@@ -142,6 +157,18 @@ jobs:
           if [ ! -f mykc_core.ko ]; then echo "!! mykc_core.ko 不存在"; exit 1; fi
 
           modinfo mykc_core.ko 2>/dev/null | head -12 || true
+
+          echo "=== [0/4] ★ CFI 类型签名校验 (路线 B 命门) ==="
+          KCFI_N=$(readelf -sW mykc_core.ko 2>/dev/null | grep -c 'kcfi_typeid' || true)
+          echo "KCFI_TYPEID_COUNT=$KCFI_N"
+          if [ "$KCFI_N" -lt 1 ]; then
+            echo "FAIL: 产物无 __kcfi_typeid_* 符号 => 必崩机 (CFI 未生效)"
+            echo "  排查: clang 是否支持 -fsanitize=kcfi / gki_defconfig CFI_CLANG 是否真开"
+            exit 1
+          fi
+          echo "OK: kCFI 类型签名已生成 ($KCFI_N 个)"
+          echo "--- CFI 段预览 ---"
+          readelf -SW mykc_core.ko 2>/dev/null | grep -iE 'cfi|kcfi' || echo "(无独立 CFI 段, 用 typeid 符号判定)"
 
           echo "=== [1/3] vermagic 校验 (必须含 modversions) ==="
           VM=$(strings mykc_core.ko | grep -m1 '^vermagic=' || true)
