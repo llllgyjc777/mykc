@@ -36,6 +36,13 @@ jobs:
           echo "CLANG_BIN=$CLANG" >> $GITHUB_ENV
           echo "clang = $CLANG"
           $CLANG --version | head -2
+          # ★ 关键修复: 把 clang 工具链 bin 加入 PATH -> make 才能找到 ld.lld
+          CLANG_DIR=$(dirname "$CLANG")
+          echo "$CLANG_DIR" >> $GITHUB_PATH
+          export PATH="$CLANG_DIR:$PATH"
+          echo "=== 工具链自检 ==="
+          ls -la "$CLANG_DIR"/ld.lld "$CLANG_DIR"/llvm-ar "$CLANG_DIR"/llvm-nm 2>&1 | head -6
+          "$CLANG_DIR"/ld.lld --version 2>&1 | head -2
 
       - name: 下载 GKI 预编译内核产物 (KMI android15-6.6)
         run: |
@@ -108,6 +115,17 @@ jobs:
             *modversions*) echo "OK: vermagic 含 modversions" ;;
             *) echo "FAIL: vermagic 缺 modversions"; exit 1 ;;
           esac
+          echo "=== MYKC 禁用符号 UND 强校验 ==="
+          UND=$(readelf -sW mykc_core.ko 2>/dev/null | awk '$7=="UND"{print $8}' | sort -u)
+          echo "$UND" | head -80
+          BAD=$(echo "$UND" | grep -cE '^(kallsyms_lookup_name|_text|__pte_offset_map)$')
+          echo "BAD_COUNT=$BAD"
+          if [ "$BAD" != "0" ]; then
+            echo "❌ 仍引用未导出符号"; exit 1
+          fi
+          echo "✅ UND 表干净"
+          # 确认 kprobe 符号已进来（v4 特征）
+          echo "KP: $(echo "$UND" | grep -cE 'kprobe')"
 
       - name: 生成自释放脚本
         run: |
