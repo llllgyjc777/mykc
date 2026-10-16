@@ -24,18 +24,39 @@ jobs:
 
       - name: 下载 Android clang 工具链
         run: |
+          set -o pipefail
           mkdir -p $HOME/tc && cd $HOME/tc
-          echo "下载 prebuilt clang..."
-          git clone --depth 1 \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-            clang-tc 2>&1 | tail -3
+          echo "下载 prebuilt clang (镜像 + 重试)..."
+          OK=0
+          for MIRROR in \
+            "https://github.com/aosp-mirror/platform_prebuilts_clang_host_linux-x86" \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86" ; do
+            for TRY in 1 2 3; do
+              echo "--- mirror=$MIRROR try=$TRY ---"
+              rm -rf clang-tc
+              if git clone --depth 1 "$MIRROR" clang-tc 2>&1 | tail -3; then
+                if ls $HOME/tc/clang-tc/clang-r*/bin/clang >/dev/null 2>&1; then OK=1; break; fi
+              fi
+              sleep 5
+            done
+            [ "$OK" = "1" ] && break
+          done
+          if [ "$OK" != "1" ]; then echo "!! clang 下载失败"; exit 1; fi
           CLANG=$(ls $HOME/tc/clang-tc/clang-r*/bin/clang 2>/dev/null | sort | tail -1)
           if [ -z "$CLANG" ]; then
             CLANG=$(find $HOME/tc/clang-tc -name clang -type f -path '*bin*' | head -1)
           fi
+          if [ -z "$CLANG" ]; then echo "!! 找不到 clang 可执行文件"; exit 1; fi
           echo "CLANG_BIN=$CLANG" >> $GITHUB_ENV
           echo "clang = $CLANG"
           $CLANG --version | head -2
+          CLANG_DIR=$(dirname "$CLANG")
+          echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_ENV
+          echo "$CLANG_DIR" >> $GITHUB_PATH
+          export PATH="$CLANG_DIR:$PATH"
+          echo "=== 工具链自检 ==="
+          ls -la "$CLANG_DIR"/ld.lld "$CLANG_DIR"/llvm-ar "$CLANG_DIR"/llvm-nm 2>&1 | head -6
+          "$CLANG_DIR"/ld.lld --version 2>&1 | head -2
           # ★ 关键修复: 把 clang 工具链 bin 加入 PATH -> make 才能找到 ld.lld
           CLANG_DIR=$(dirname "$CLANG")
           echo "$CLANG_DIR" >> $GITHUB_PATH
@@ -53,9 +74,21 @@ jobs:
 
           # 方式: 从 kernel/common 分支直接拉构建产物
           # Google 提供 prebuilt KMI 在 android.googlesource.com 的特定 tag
-          git clone --depth 1 -b android15-6.6 \
-            https://android.googlesource.com/kernel/common \
-            common 2>&1 | tail -3
+          OK=0
+          for MIRROR in \
+            "https://github.com/aosp-mirror/kernel_common" \
+            "https://android.googlesource.com/kernel/common" ; do
+            for TRY in 1 2 3; do
+              echo "--- gki mirror=$MIRROR try=$TRY ---"
+              rm -rf common
+              if git clone --depth 1 -b android15-6.6 "$MIRROR" common 2>&1 | tail -3; then
+                if [ -f common/Makefile ]; then OK=1; break; fi
+              fi
+              sleep 8
+            done
+            [ "$OK" = "1" ] && break
+          done
+          if [ "$OK" != "1" ]; then echo "!! GKI 源码下载失败"; exit 1; fi
 
           cd common
           echo "=== 检查是否含 Module.symvers ==="
@@ -95,12 +128,16 @@ jobs:
         run: |
           cd $GITHUB_WORKSPACE
           CLANG=${{ env.CLANG_BIN }}
+          export PATH="${{ env.CLANG_DIR }}:$PATH"
+          echo "=== PATH 自检 ==="
+          which ld.lld || echo "!! ld.lld 不在 PATH"
           echo "=== 开始编译模块 ==="
           # KBUILD_MODPOST_WARN=1: 未解析符号降级为警告，保证出 .ko
           make -C ${{ env.KERNEL_DIR }} \
             M=$GITHUB_WORKSPACE \
             ARCH=arm64 \
             CC=$CLANG \
+            LD=ld.lld \
             LLVM=1 \
             KBUILD_MODPOST_WARN=1 \
             modules 2>&1 | tail -40
