@@ -78,7 +78,15 @@ jobs:
           done
           if [ "$OK" != "1" ]; then echo "!! GKI 源码下载失败"; exit 1; fi
           cd common
-          echo "=== 内核版本 ==="
+          echo "=== 内核版本 (原始) ==="
+          head -5 Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL' || true
+          # ★★★ 路线 B 修正: AOSP android15-6.6 HEAD 是 6.6.111, 设备真实是 6.6.118
+          #   vermagic 第一段 6.6.xxx 必须精确匹配, 故直接 patch Makefile SUBLEVEL
+          ORIG_SUB=$(grep -E '^SUBLEVEL *=' Makefile | head -1 | sed 's/[^0-9]//g')
+          echo "ORIG_SUBLEVEL=$ORIG_SUB -> patch to 118"
+          sed -i 's/^SUBLEVEL *=.*/SUBLEVEL = 118/' Makefile
+          grep -E '^SUBLEVEL *=' Makefile | head -1
+          echo "=== 内核版本 (patch 后) ==="
           head -5 Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL' || true
           echo "KERNEL_DIR=$HOME/gki/common" >> $GITHUB_ENV
 
@@ -104,6 +112,13 @@ jobs:
           ./scripts/config --file .config -e CFI_CLANG 2>/dev/null || true
           ./scripts/config --file .config -d CFI_PERMISSIVE 2>/dev/null || true
           ./scripts/config --file .config -e CFI_ICALL_NORMALIZE_INTEGERS 2>/dev/null || true
+          # ★★★ 路线 B 关键修正: kCFI 的 __kcfi_typeid_* 符号需要 LTO 才能在链接期生成
+          #   AOSP android15-6.6 默认 CONFIG_LTO_NONE=y -> typeid=0 (实证 run #59)
+          #   切到 ThinLTO (GKI 官方默认)
+          ./scripts/config --file .config -d LTO_NONE 2>/dev/null || true
+          ./scripts/config --file .config -e LTO_CLANG 2>/dev/null || true
+          ./scripts/config --file .config -e LTO_CLANG_THIN 2>/dev/null || true
+          ./scripts/config --file .config -d LTO_CLANG_FULL 2>/dev/null || true
           make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -3
           echo "=== .config 关键项自检 ==="
           grep -E '^CONFIG_(MODVERSIONS|MODULE_SIG|MODULE_SIG_FORCE|LOCALVERSION)' .config || true
@@ -116,8 +131,13 @@ jobs:
           else
             echo "OK: CONFIG_CFI_CLANG=y 已开启"
           fi
-          # ★ CFI 需要 LTO 才能生成完整 typeid 表? GKI 用 ThinLTO; 这里不强开, 保持 gki 默认
-          grep -E '^CONFIG_(LTO|LTO_CLANG)' .config || true
+          echo "=== LTO / CFI 最终状态自检 ==="
+          grep -E '^CONFIG_(LTO_CLANG_THIN|LTO_CLANG_FULL|LTO_NONE|CFI_CLANG|CFI_PERMISSIVE|CFI_ICALL_NORMALIZE_INTEGERS)=' .config || true
+          if ! grep -q '^CONFIG_LTO_CLANG_THIN=y' .config; then
+            echo "!! 警告: CONFIG_LTO_CLANG_THIN 未生效 (typeid 可能仍为 0)"
+          else
+            echo "OK: CONFIG_LTO_CLANG_THIN=y (ThinLTO 已开, 可生成 kCFI typeid)"
+          fi
 
           echo "=== modules_prepare (只需头文件, 不编 vmlinux) ==="
           make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 modules_prepare 2>&1 | tail -10
