@@ -1,0 +1,223 @@
+name: Build MYKC Kernel Module
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc bison flex libssl-dev libelf-dev kmod \
+            zip unzip python3 git make wget curl cpio
+          echo "=== 磁盘 ==="; df -h /
+          echo "=== 内存 ==="; free -h
+
+      - name: 下载 Android clang 工具链
+        run: |
+          set -o pipefail
+          mkdir -p $HOME/tc && cd $HOME/tc
+          echo "下载 prebuilt clang (镜像 + 重试)..."
+          OK=0
+          for MIRROR in \
+            "https://github.com/aosp-mirror/platform_prebuilts_clang_host_linux-x86" \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86" ; do
+            for TRY in 1 2 3; do
+              echo "--- mirror=$MIRROR try=$TRY ---"
+              rm -rf clang-tc
+              if git clone --depth 1 "$MIRROR" clang-tc 2>&1 | tail -3; then
+                if ls $HOME/tc/clang-tc/clang-r*/bin/clang >/dev/null 2>&1; then OK=1; break; fi
+              fi
+              sleep 5
+            done
+            [ "$OK" = "1" ] && break
+          done
+          if [ "$OK" != "1" ]; then echo "!! clang 下载失败"; exit 1; fi
+          CLANG=$(ls $HOME/tc/clang-tc/clang-r*/bin/clang 2>/dev/null | sort | tail -1)
+          if [ -z "$CLANG" ]; then
+            CLANG=$(find $HOME/tc/clang-tc -name clang -type f -path '*bin*' | head -1)
+          fi
+          if [ -z "$CLANG" ]; then echo "!! 找不到 clang 可执行文件"; exit 1; fi
+          CLANG_DIR=$(dirname "$CLANG")
+          echo "CLANG_BIN=$CLANG" >> $GITHUB_ENV
+          echo "CLANG_DIR=$CLANG_DIR" >> $GITHUB_ENV
+          echo "$CLANG_DIR" >> $GITHUB_PATH
+          export PATH="$CLANG_DIR:$PATH"
+          echo "clang = $CLANG"
+          $CLANG --version | head -2
+          echo "=== 工具链自检 (ld.lld 必须在 PATH) ==="
+          ls -la "$CLANG_DIR"/ld.lld "$CLANG_DIR"/llvm-ar "$CLANG_DIR"/llvm-nm 2>&1 | head -6
+          "$CLANG_DIR"/ld.lld --version 2>&1 | head -2
+
+      - name: 下载 GKI 内核源码 (KMI android15-6.6)
+        run: |
+          set -o pipefail
+          mkdir -p $HOME/gki && cd $HOME/gki
+          OK=0
+          for MIRROR in \
+            "https://github.com/aosp-mirror/kernel_common" \
+            "https://android.googlesource.com/kernel/common" ; do
+            for TRY in 1 2 3; do
+              echo "--- gki mirror=$MIRROR try=$TRY ---"
+              rm -rf common
+              if git clone --depth 1 -b android15-6.6 "$MIRROR" common 2>&1 | tail -3; then
+                if [ -f common/Makefile ]; then OK=1; break; fi
+              fi
+              sleep 8
+            done
+            [ "$OK" = "1" ] && break
+          done
+          if [ "$OK" != "1" ]; then echo "!! GKI 源码下载失败"; exit 1; fi
+          cd common
+          echo "=== 内核版本 ==="
+          head -5 Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL' || true
+          echo "KERNEL_DIR=$HOME/gki/common" >> $GITHUB_ENV
+
+      - name: 生成模块构建环境 (不编 vmlinux)
+        run: |
+          set -o pipefail
+          cd $HOME/gki/common
+          CLANG=${{ env.CLANG_BIN }}
+
+          echo "=== gki_defconfig ==="
+          make ARCH=arm64 CC=$CLANG LLVM=1 gki_defconfig 2>&1 | tail -5
+
+          # 允许未签名模块
+          ./scripts/config --file .config -d MODULE_SIG_FORCE 2>/dev/null || true
+          ./scripts/config --file .config -e MODULE_SIG 2>/dev/null || true
+          # ★ 核心: 开 MODVERSIONS -> vermagic 带 modversions 单词 (设备内核 CONFIG_MODVERSIONS=y)
+          ./scripts/config --file .config -e MODVERSIONS 2>/dev/null || true
+          # ★ 把 LOCALVERSION 对齐设备内核, 让 vermagic 第一段也一致 (双保险)
+          ./scripts/config --file .config --set-str LOCALVERSION "-android15-8-gc44b714366cc-abogki519650608-4k" 2>/dev/null || true
+          ./scripts/config --file .config -d LOCALVERSION_AUTO 2>/dev/null || true
+          # ★★★ 路线 B 核心: 强制开启 CFI_CLANG (设备内核 CONFIG_CFI_CLANG=y 严格模式)
+          #   不开 CFI 的模块没有 __kcfi_typeid_* 符号 => 间接调用被内核 check_cfi 拦 => BUG => 秒重启
+          ./scripts/config --file .config -e CFI_CLANG 2>/dev/null || true
+          ./scripts/config --file .config -d CFI_PERMISSIVE 2>/dev/null || true
+          ./scripts/config --file .config -e CFI_ICALL_NORMALIZE_INTEGERS 2>/dev/null || true
+          make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -3
+          echo "=== .config 关键项自检 ==="
+          grep -E '^CONFIG_(MODVERSIONS|MODULE_SIG|MODULE_SIG_FORCE|LOCALVERSION)' .config || true
+          grep -E '^CONFIG_(CFI_CLANG|CFI_PERMISSIVE|SHADOW_CALL_STACK|ARM64_PTR_AUTH_KERNEL)' .config || true
+          if ! grep -q '^CONFIG_MODVERSIONS=y' .config; then
+            echo "!! CONFIG_MODVERSIONS 未生效, 中止"; exit 1
+          fi
+          if ! grep -q '^CONFIG_CFI_CLANG=y' .config; then
+            echo "!! 警告: CONFIG_CFI_CLANG 未生效 (继续, 但产物可能再次崩机)"
+          else
+            echo "OK: CONFIG_CFI_CLANG=y 已开启"
+          fi
+          # ★ CFI 需要 LTO 才能生成完整 typeid 表? GKI 用 ThinLTO; 这里不强开, 保持 gki 默认
+          grep -E '^CONFIG_(LTO|LTO_CLANG)' .config || true
+
+          echo "=== modules_prepare (只需头文件, 不编 vmlinux) ==="
+          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 modules_prepare 2>&1 | tail -10
+
+          echo "=== ★ 跳过 vmlinux ==="
+          echo "  理由(实证): v5 日志显示 vmlinux 编完只产出 vmlinux.symvers/System.map,"
+          echo "  并不生成模块用的 Module.symvers; 模块靠 KBUILD_MODPOST_WARN=1 兜底即可。"
+          echo "  符号是否正确导出, 在编译期无 Module.symvers 时本就无法校验,"
+          echo "  真正的把关点是真机 insmod(Unknown symbol 会立刻现形)。"
+
+      - name: 编译 + 打补丁 + 校验 mykc_core.ko
+        run: |
+          set -o pipefail
+          cd $GITHUB_WORKSPACE
+          CLANG=${{ env.CLANG_BIN }}
+          export PATH="${{ env.CLANG_DIR }}:$PATH"
+
+          echo "=== PATH 自检 ==="
+          which ld.lld || echo "!! ld.lld 不在 PATH"
+
+          echo "=== 编译模块 (★ 显式开启 kCFI) ==="
+          # ★★★ 路线 B 核心: 外部模块编译必须显式传 -fsanitize=kcfi,
+          #   否则产物没有 __kcfi_typeid_* 段 => 内核 check_cfi 拦截 => BUG => 秒重启
+          #   设备内核: CONFIG_CFI_CLANG=y + CFI_PERMISSIVE 未开 (严格模式)
+          # ★ 注: kCFI 的 -fsanitize=kcfi 由 Makefile 的 ccflags-y 传入,
+          #   这里不再用 KCFLAGS (避免重复 + 触发 -Wunused-command-line-argument)
+          make -C ${{ env.KERNEL_DIR }} \
+            M=$GITHUB_WORKSPACE \
+            ARCH=arm64 \
+            CC=$CLANG \
+            LD=ld.lld \
+            LLVM=1 \
+            KBUILD_MODPOST_WARN=1 \
+            modules 2>&1 | tail -40
+
+          echo "=== 产物 ==="
+          ls -la *.ko 2>/dev/null || { echo "!! 无 .ko 产出"; exit 1; }
+          if [ ! -f mykc_core.ko ]; then echo "!! mykc_core.ko 不存在"; exit 1; fi
+
+          modinfo mykc_core.ko 2>/dev/null | head -12 || true
+
+          echo "=== [0/4] ★ CFI 类型签名校验 (路线 B 命门) ==="
+          KCFI_N=$(readelf -sW mykc_core.ko 2>/dev/null | grep -c 'kcfi_typeid' || true)
+          echo "KCFI_TYPEID_COUNT=$KCFI_N"
+          if [ "$KCFI_N" -lt 1 ]; then
+            echo "FAIL: 产物无 __kcfi_typeid_* 符号 => 必崩机 (CFI 未生效)"
+            echo "  排查: clang 是否支持 -fsanitize=kcfi / gki_defconfig CFI_CLANG 是否真开"
+            exit 1
+          fi
+          echo "OK: kCFI 类型签名已生成 ($KCFI_N 个)"
+          echo "--- CFI 段预览 ---"
+          readelf -SW mykc_core.ko 2>/dev/null | grep -iE 'cfi|kcfi' || echo "(无独立 CFI 段, 用 typeid 符号判定)"
+
+          echo "=== [1/3] vermagic 校验 (必须含 modversions) ==="
+          VM=$(strings mykc_core.ko | grep -m1 '^vermagic=' || true)
+          echo "GOT: $VM"
+          case "$VM" in
+            *modversions*) echo "OK: vermagic 含 modversions" ;;
+            *) echo "FAIL: vermagic 缺 modversions"; exit 1 ;;
+          esac
+
+          echo "=== [2/3] 禁用符号 UND 校验 ==="
+          # ★ 注意: grep -c 无匹配时退出码=1, 在 bash -e 下会误杀整个脚本 -> 必须 || true
+          UND=$(readelf -sW mykc_core.ko 2>/dev/null | awk '$7=="UND"{print $8}' | sort -u)
+          echo "$UND" | head -80
+          BAD=$(echo "$UND" | grep -cE '^(kallsyms_lookup_name|_text|__pte_offset_map)$' || true)
+          echo "BAD_COUNT=$BAD"
+          if [ "$BAD" != "0" ]; then echo "FAIL: 仍引用未导出符号"; exit 1; fi
+          echo "OK: UND 表干净"
+          echo "kprobe 相关符号数: $(echo "$UND" | grep -cE 'kprobe' || true)"
+
+          echo "=== [3/3] 追加 __versions 段 (设备内核 CONFIG_MODVERSIONS=y 必备) ==="
+          echo "  原理: same_magic(a,b,has_crcs=true) 会跳过第一段(内核版本号);"
+          echo "        has_crcs 取决于是否存在 __versions 段; size=0 时 check_version"
+          echo "        循环不执行, 直接放行所有符号。"
+          python3 $GITHUB_WORKSPACE/add_versions2.py mykc_core.ko
+          readelf -SW mykc_core.ko | grep -E '__versions|Name' || true
+          if ! readelf -SW mykc_core.ko | grep -q '__versions'; then
+            echo "FAIL: __versions 段未写入"; exit 1
+          fi
+          echo "OK: __versions 段已就位"
+          echo "=== 最终尺寸 ==="; ls -la mykc_core.ko
+
+      - name: 生成自释放脚本
+        run: |
+          cd $GITHUB_WORKSPACE
+          if [ ! -f mykc_core.ko ]; then
+            echo "❌ 未产出 mykc_core.ko"; ls -la *.o *.ko 2>/dev/null || true; exit 1
+          fi
+          printf '#!/bin/sh\n# mykc self-extract + insmod\nset -e\nTMP=$(mktemp)\ntrap "rm -f \\"$TMP\\"" EXIT INT TERM\nbase64 -d <<'"'"'__MYKC_KO__'"'"' > "$TMP"\n' > mykc.ko.sh
+          base64 mykc_core.ko >> mykc.ko.sh
+          printf '__MYKC_KO__\ninsmod "$TMP"\nif [ $? -eq 0 ]; then echo "mykc loaded OK"; else echo "FAILED"; exit 1; fi\n' >> mykc.ko.sh
+          chmod 755 mykc.ko.sh
+          echo "打包完成: $(wc -c < mykc.ko.sh) bytes"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: mykc-module
+          path: |
+            mykc_core.ko
+            mykc.ko.sh
+          retention-days: 30

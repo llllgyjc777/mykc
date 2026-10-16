@@ -38,8 +38,11 @@ LLVM            ?= $(HOME)/toolchains/clang/bin
 EXTRA_CFLAGS := -Wno-unused-variable -Wno-unused-function -Wno-format
 
 # 模块级 flag (ccflags-y 对这个 obj-m 下所有 .c 生效)
+# ★ 只留 -fsanitize=kcfi (clang-r614150 已不需要 canonical-jump-tables 开关;
+#   多了会因 -Werror,-Wunused-command-line-argument 直接编挂 —— 实证 run #56)
+# ★ 再补一个 -Wno-unused-command-line-argument 兜底, 防止其他 flag 重复时报错
 ccflags-y += -fsanitize=kcfi
-ccflags-y += -fno-sanitize-cfi-canonical-jump-tables
+ccflags-y += -Wno-unused-command-line-argument
 
 all:
 	@echo "=== 编译 mykc_core.ko ==="
