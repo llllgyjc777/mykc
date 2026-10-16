@@ -142,15 +142,39 @@ jobs:
           # ★★★ 路线 B 核心: 外部模块编译必须显式传 -fsanitize=kcfi,
           #   否则产物没有 __kcfi_typeid_* 段 => 内核 check_cfi 拦截 => BUG => 秒重启
           #   设备内核: CONFIG_CFI_CLANG=y + CFI_PERMISSIVE 未开 (严格模式)
-          make -C ${{ env.KERNEL_DIR }} \
-            M=$GITHUB_WORKSPACE \
-            ARCH=arm64 \
-            CC=$CLANG \
-            LD=ld.lld \
-            LLVM=1 \
-            KBUILD_MODPOST_WARN=1 \
-            KCFLAGS="-fsanitize=kcfi" \
-            modules 2>&1 | tail -40
+          # ★★★ kCFI flag 用 KCFLAGS 传 (内核 Makefile 对 KCFLAGS 有最高优先级,
+          #     ccflags-y 在外部模块路径下可能被覆盖 —— 实证 run #57: typeid=0)
+          # ★ 先探测 clang 是否支持 -fsanitize=kcfi, 失败则退回不传
+          CFI_OK=0
+          if echo 'int main(void){return 0;}' > /tmp/t.c && \
+             $CLANG -fsanitize=kcfi -c /tmp/t.c -o /tmp/t.o 2>/dev/null; then
+            CFI_OK=1
+            echo "OK: clang 支持 -fsanitize=kcfi"
+          else
+            echo "!! clang 不支持 -fsanitize=kcfi (将不传该 flag)"
+          fi
+
+          echo "=== 编译模块 (V=1 打印真实命令行) ==="
+          if [ "$CFI_OK" = "1" ]; then
+            make -C ${{ env.KERNEL_DIR }} \
+              M=$GITHUB_WORKSPACE \
+              ARCH=arm64 \
+              CC=$CLANG \
+              LD=ld.lld \
+              LLVM=1 \
+              KBUILD_MODPOST_WARN=1 \
+              KCFLAGS="-fsanitize=kcfi -Wno-unused-command-line-argument" \
+              modules 2>&1 | grep -aE 'clang|error|warning|CC \[M\]|\.o' | tail -60
+          else
+            make -C ${{ env.KERNEL_DIR }} \
+              M=$GITHUB_WORKSPACE \
+              ARCH=arm64 \
+              CC=$CLANG \
+              LD=ld.lld \
+              LLVM=1 \
+              KBUILD_MODPOST_WARN=1 \
+              modules 2>&1 | tail -40
+          fi
 
           echo "=== 产物 ==="
           ls -la *.ko 2>/dev/null || { echo "!! 无 .ko 产出"; exit 1; }
