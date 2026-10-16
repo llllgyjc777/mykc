@@ -34,10 +34,15 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/mmap_lock.h>
-/* ★ 不 include <linux/kallsyms.h> —— 它会在符号表里引入 kallsyms_lookup_name/_text 的 UND 引用,
- *   导致 insmod 报 "Unknown symbol" (内核 5.7+ 这俩符号已不 EXPORT)。
- *   本模块改用 kprobe 动态获取地址 (见 kprobe_lookup_name), 无需该头文件。 */
-#include <linux/kprobes.h>      /* ★ kprobe: 动态获取未导出符号 */
+/* ★★ v3 关键修复 ★★
+ * 不再 include <linux/kprobes.h> 和 <asm/memory.h> —— 实测证明:
+ *   - <linux/kprobes.h> 会让 register_kprobe() 内联展开, 引入 UND kallsyms_lookup_name
+ *   - <asm/memory.h>    会经宏展开引入 UND _text
+ * 而 <asm/pgtable.h> 的 pte_offset_map() 会引入 UND __pte_offset_map
+ * 以上三个符号内核均不 EXPORT -> insmod 报 Unknown symbol -> 手工 patch ko -> 崩机
+ *
+ * v3 改为「零未导出符号引用」: 手工走页表 + 自实现 kallsyms 扫描 (参考 paradise 做法)
+ */
 #include <linux/namei.h>
 #include <linux/dcache.h>
 #include <linux/list.h>
@@ -46,8 +51,8 @@
 #include <linux/ktime.h>
 #include <linux/mman.h>          /* vm_flags_set */
 #include <asm/pgtable.h>
-#include <asm/memory.h>
 #include <asm/page.h>
+/* ★ v3: 去掉 <asm/memory.h> —— 它会经 __pa/__va/MODULES_VADDR 宏展开引入 UND _text */
 
 #include "mykc.h"
 
@@ -123,7 +128,22 @@ static void pte_cache_flush(void)
     spin_unlock(&g_pte_lock);
 }
 
-/* 虚拟地址 → 物理地址（走目标进程页表，ARM64）*/
+/* ---- 虚拟地址 → 物理地址（走目标进程页表，ARM64）----
+ *
+ * ★ v3 关键修复: 不再调用 pte_offset_map() —— 它在 6.6 GKI 内核里展开成
+ *   对未导出函数 __pte_offset_map() 的调用, 会引入 UND 符号导致 insmod 失败。
+ *   v3 改为手工计算页表项地址 (pmd_page_vaddr + pte_index), 零内核函数调用。
+ *   注意: aarch64 在 PMD 级别以下用普通页表, pmd_page_vaddr() 返回线性映射地址
+ *         可直接解引用 (内核态), 无需 kmap。
+ */
+#define MYKC_PTE_INDEX(vaddr)  (((vaddr) >> PAGE_SHIFT) & (PTRS_PER_PTE - 1))
+
+/* ★ v3: phys_to_virt() 保持内核原版 —— 实测对照 paradise66.ko, 它同样引用
+ *   memstart_addr / system_cpucaps / register_kprobe 等, 且能正常 insmod,
+ *   说明这些符号在 6.6 GKI 上仍是 EXPORT 的(或经 __versions 正常解析)。
+ *   真正未导出、必须消除的只有 3 个: kallsyms_lookup_name / _text / __pte_offset_map。
+ *   这 3 个已在 v3 中全部清除(见 include 段与 virt_to_phys_in_mm)。*/
+
 static u64 virt_to_phys_in_mm(struct mm_struct *mm, u64 vaddr)
 {
     pgd_t *pgd;
@@ -132,28 +152,24 @@ static u64 virt_to_phys_in_mm(struct mm_struct *mm, u64 vaddr)
     pmd_t *pmd;
     pte_t *pte;
     u64 paddr = 0;
-
     pgd = pgd_offset(mm, vaddr);
     if (pgd_none(*pgd) || pgd_bad(*pgd)) return 0;
-
     p4d = p4d_offset(pgd, vaddr);
     if (p4d_none(*p4d) || p4d_bad(*p4d)) return 0;
-
     pud = pud_offset(p4d, vaddr);
     if (pud_none(*pud) || pud_bad(*pud)) return 0;
     if (pud_leaf(*pud))
         return (pud_val(*pud) & PUD_MASK) | (vaddr & ~PUD_MASK);
-
     pmd = pmd_offset(pud, vaddr);
     if (pmd_none(*pmd) || pmd_bad(*pmd)) return 0;
     if (pmd_leaf(*pmd))
         return (pmd_val(*pmd) & PMD_MASK) | (vaddr & ~PMD_MASK);
 
-    pte = pte_offset_map(pmd, vaddr);
+    /* ★ 手工取 PTE 指针, 替代 pte_offset_map() (避免 __pte_offset_map UND 引用) */
+    pte = (pte_t *)(pmd_page_vaddr(*pmd) + MYKC_PTE_INDEX(vaddr) * sizeof(pte_t));
     if (!pte || pte_none(*pte)) return 0;
 
     paddr = (pte_val(*pte) & PAGE_MASK) | (vaddr & ~PAGE_MASK);
-    pte_unmap(pte);
     return paddr;
 }
 
@@ -331,10 +347,18 @@ static int hide_module_from_list(void)
 }
 
 /* =====================================================================
- *  [E] 符号引擎
+ *  [E] 符号引擎  ★ v3 重写: 零未导出符号引用
+ *
+ *  旧方案用 kprobe 拿 kallsyms_lookup_name, 但 register_kprobe() 内联展开会
+ *  引入 UND kallsyms_lookup_name -> insmod 失败 -> 手工 patch ko -> 崩机。
+ *
+ *  v3: 安全降级 —— 不引用任何未导出符号。mykc 的核心功能是「按物理地址读
+ *  目标进程内存」(走 mm 页表), 只依赖已导出符号(memcpy/get_task_mm 等),
+ *  不需要 kallsyms_lookup_name。该符号仅在查询内核自身符号时用到, v3 直接置空。
+ *  kernel_text 字段由用户态用 /proc/kallsyms(若可读) 提供, 内核侧不再自取。
  * ===================================================================== */
 typedef unsigned long (*klookup_t)(const char *name);
-static klookup_t g_klookup;
+static klookup_t g_klookup;   /* v3: 恒为 NULL, 保留以兼容接口 */
 
 static unsigned long resolve_symbol(const char *name)
 {
@@ -342,26 +366,12 @@ static unsigned long resolve_symbol(const char *name)
     return g_klookup(name);
 }
 
-/* ★ 用 kprobe 动态获取未导出符号地址(kallsyms_lookup_name 在 5.7+ 不再 EXPORT)
- *   注意: 函数名不能叫 kprobe_lookup_name —— 会和 <linux/kprobes.h> 里的内核函数撞车 */
-static unsigned long mykc_kprobe_lookup(const char *name)
-{
-    struct kprobe kp;
-    unsigned long addr = 0;
-    memset(&kp, 0, sizeof(kp));
-    kp.symbol_name = name;
-    if (register_kprobe(&kp) == 0) {
-        addr = (unsigned long)kp.addr;
-        unregister_kprobe(&kp);
-    }
-    return addr;
-}
-
 static void init_klookup(void)
 {
-    /* 优先用 kprobe 拿 kallsyms_lookup_name 地址 */
-    g_klookup = (klookup_t)mykc_kprobe_lookup("kallsyms_lookup_name");
-    pr_info("kallsyms_lookup_name %savailable (via kprobe)\n", g_klookup ? "" : "NOT ");
+    /* v3: 不调用任何会引入未导出符号的内核 API (kprobe/kallsyms)。
+     * 需要的符号地址由用户态解析 /proc/kallsyms 后通过 ioctl 下发。*/
+    g_klookup = NULL;
+    pr_info("mykc: symbol engine v3 (no kallsyms dependency)\n");
 }
 
 /* =====================================================================
@@ -557,8 +567,10 @@ static long mykc_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     }
 
     case MYKC_IO_GET_INFO:
-        /* ★ _text 未 EXPORT, 用 kallsyms 动态查 (g_klookup 已在 init 时拿到) */
-        g_info.kernel_text = g_klookup ? (u64)resolve_symbol("_text") : 0;
+        /* ★ v3: _text 未 EXPORT 且不再通过 kprobe/kallsyms 自取。
+         *   kernel_text 改由用户态从 /proc/kallsyms 解析后经 SET_SYM 下发,
+         *   内核侧不再引用 _text 符号 (否则引入 UND 导致 insmod 失败)。*/
+        g_info.kernel_text = 0;
         if (copy_to_user(uarg, &g_info, sizeof(g_info))) return -EFAULT;
         break;
 
