@@ -137,6 +137,14 @@ struct mykc_espframe {
 #define MYKC_IO_TRACK_PID     _IOW(MYKC_MAGIC,  11, struct mykc_track)
 #define MYKC_IO_ESP_CONFIG    _IOW(MYKC_MAGIC,  12, struct mykc_espcfg)
 #define MYKC_IO_ESP_FRAME     _IOR(MYKC_MAGIC,  13, struct mykc_espframe)
+/* ★ v4: 隐身模式（S1 摘 lsmod / S2 摘 sysfs / S3 焊死 /proc/devices 入口） */
+#define MYKC_IO_STEALTH       _IOW(MYKC_MAGIC,  14, unsigned long)
+
+/* 隐身等级（数字越大越隐蔽；0=全公开，调试用） */
+#define MYKC_STEALTH_NONE     0u  /* 全公开 */
+#define MYKC_STEALTH_LIST     1u  /* 仅从 lsmod 摘除 */
+#define MYKC_STEALTH_SYSFS    2u  /* 再摘 /sys/module */
+#define MYKC_STEALTH_FULL     3u  /* 再注销 misc 设备（/proc/devices 无痕，fd 仍可用） */
 
 /* ---------- 用户态 mmap 共享环 ---------- */
 #define MYKC_RING_SIZE    (64 * 1024)
