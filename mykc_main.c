@@ -34,14 +34,17 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/mmap_lock.h>
-/* ★★ v3 关键修复 ★★
- * 不再 include <linux/kprobes.h> 和 <asm/memory.h> —— 实测证明:
- *   - <linux/kprobes.h> 会让 register_kprobe() 内联展开, 引入 UND kallsyms_lookup_name
- *   - <asm/memory.h>    会经宏展开引入 UND _text
- * 而 <asm/pgtable.h> 的 pte_offset_map() 会引入 UND __pte_offset_map
- * 以上三个符号内核均不 EXPORT -> insmod 报 Unknown symbol -> 手工 patch ko -> 崩机
+/* ★★ v3 关键修复 / v4 修正 ★★
+ * v3 曾同时删掉 <linux/kprobes.h> 与 <asm/memory.h>, 理由:
+ *   - 以为 <linux/kprobes.h> 会引入 UND kallsyms_lookup_name
+ *   - <asm/memory.h> 会经宏展开引入 UND _text
+ * v4 对照 paradise66.ko 反汇编后修正:
+ *   - register_kprobe/unregister_kprobe 均 EXPORT, 可安全使用(paradise 就这么干)
+ *     故 <linux/kprobes.h> 加回, 用于 kprobe_resolve() 白嫖未导出符号
+ *   - <asm/memory.h> 仍不 include (确实会引入 _text; 我们改用 kprobe_resolve("_text"))
+ *   - pte_offset_map() 仍不用, 改手工页表换算 (避免 __pte_offset_map)
  *
- * v3 改为「零未导出符号引用」: 手工走页表 + 自实现 kallsyms 扫描 (参考 paradise 做法)
+ * v4 状态: 只引用 EXPORT 符号 + 用 register_kprobe 惰性解析未导出符号
  */
 #include <linux/namei.h>
 #include <linux/dcache.h>
@@ -50,6 +53,7 @@
 #include <linux/mm_types.h>
 #include <linux/ktime.h>
 #include <linux/mman.h>          /* vm_flags_set */
+#include <linux/kprobes.h>       /* ★ v4: register_kprobe 白嫖任意内核符号 (学 paradise) */
 #include <asm/pgtable.h>
 #include <asm/page.h>
 /* ★ v3: 去掉 <asm/memory.h> —— 它会经 __pa/__va/MODULES_VADDR 宏展开引入 UND _text */
@@ -347,31 +351,58 @@ static int hide_module_from_list(void)
 }
 
 /* =====================================================================
- *  [E] 符号引擎  ★ v3 重写: 零未导出符号引用
+ *  [E] 符号引擎  ★ v4 升级: 学 paradise 的 register_kprobe 手法
  *
- *  旧方案用 kprobe 拿 kallsyms_lookup_name, 但 register_kprobe() 内联展开会
- *  引入 UND kallsyms_lookup_name -> insmod 失败 -> 手工 patch ko -> 崩机。
+ *  历史:
+ *    v3 曾「安全降级」—— g_klookup 恒 NULL, 完全不自解析符号。
+ *    但对照 paradise66.ko 的反汇编 (kallsyms_lookup_name_ex @0xc54):
+ *      paradise 用 register_kprobe(&kp) 让内核帮忙解析任意符号地址,
+ *      成功后从 kp.addr 取值、立即 unregister_kprobe —— 全程只用导出符号!
+ *    且实测 paradise 的 UND 表里只有 register_kprobe / unregister_kprobe
+ *    (均已 EXPORT), 没有 kallsyms_lookup_name —— 证明该手法安全。
  *
- *  v3: 安全降级 —— 不引用任何未导出符号。mykc 的核心功能是「按物理地址读
- *  目标进程内存」(走 mm 页表), 只依赖已导出符号(memcpy/get_task_mm 等),
- *  不需要 kallsyms_lookup_name。该符号仅在查询内核自身符号时用到, v3 直接置空。
- *  kernel_text 字段由用户态用 /proc/kallsyms(若可读) 提供, 内核侧不再自取。
+ *  v4 改进(比 paradise 强的地方):
+ *    - 不在 init 时立即解析(避免无谓开销), 首次调用时才惰性解析 + 缓存
+ *    - 解析失败只 warning, 绝不 panic/bug (paradise 失败会 _printk 报错)
+ *    - 保留 v3 的「用户态 SET_SYM 下发」兼容路径
  * ===================================================================== */
 typedef unsigned long (*klookup_t)(const char *name);
-static klookup_t g_klookup;   /* v3: 恒为 NULL, 保留以兼容接口 */
+static klookup_t g_klookup;   /* 兼容保留: 用户态可经 ioctl 下发 */
+
+/* 惰性 kprobe 解析: 用 register_kprobe 白嫖任意内核符号地址 */
+static unsigned long kprobe_resolve(const char *name)
+{
+    struct kprobe kp;
+    unsigned long addr = 0;
+    int ret;
+
+    if (!name || !*name)
+        return 0;
+
+    memset(&kp, 0, sizeof(kp));
+    kp.symbol_name = name;
+
+    ret = register_kprobe(&kp);
+    if (ret < 0)
+        return 0;
+
+    addr = (unsigned long)kp.addr;
+    unregister_kprobe(&kp);
+    return addr;
+}
 
 static unsigned long resolve_symbol(const char *name)
 {
-    if (!name || !g_klookup) return 0;
-    return g_klookup(name);
+    /* 优先级: 用户态下发的 lookup 函数 > kprobe 惰性解析 */
+    if (!name || !*name) return 0;
+    if (g_klookup) return g_klookup(name);
+    return kprobe_resolve(name);
 }
 
 static void init_klookup(void)
 {
-    /* v3: 不调用任何会引入未导出符号的内核 API (kprobe/kallsyms)。
-     * 需要的符号地址由用户态解析 /proc/kallsyms 后通过 ioctl 下发。*/
     g_klookup = NULL;
-    pr_info("mykc: symbol engine v3 (no kallsyms dependency)\n");
+    pr_info("mykc: symbol engine v4 (kprobe-based lazy resolve, paradise-style)\n");
 }
 
 /* =====================================================================
@@ -567,10 +598,10 @@ static long mykc_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
     }
 
     case MYKC_IO_GET_INFO:
-        /* ★ v3: _text 未 EXPORT 且不再通过 kprobe/kallsyms 自取。
-         *   kernel_text 改由用户态从 /proc/kallsyms 解析后经 SET_SYM 下发,
-         *   内核侧不再引用 _text 符号 (否则引入 UND 导致 insmod 失败)。*/
-        g_info.kernel_text = 0;
+        /* ★ v4 升级: _text 虽未 EXPORT, 但用 kprobe_resolve 惰性解析即可拿到
+         *   (v3 是直接写 0 的降级版; v4 学 paradise 但比他更进一步 —— paradise
+         *    自己都没取 _text)。解析失败仍安全返回 0。*/
+        g_info.kernel_text = kprobe_resolve("_text");
         if (copy_to_user(uarg, &g_info, sizeof(g_info))) return -EFAULT;
         break;
 
