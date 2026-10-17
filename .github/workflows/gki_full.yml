@@ -1,0 +1,189 @@
+name: GKI Full Build for kCFI
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/gki_full.yml'
+
+env:
+  KERNEL_BRANCH: android15-6.6
+
+jobs:
+  full-build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      # ---------- 0. 依赖 ----------
+      - name: '[0/7] Dependencies'
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            cpio gzip xz-utils git curl python3 rsync
+          echo "=== ok ==="
+          nproc; free -h | head -2; df -h / | tail -1
+
+      # ---------- 1. 取 Android clang ----------
+      - name: '[1/7] Fetch Android clang'
+        run: |
+          set -e
+          mkdir -p $HOME/tc && cd $HOME/tc
+          OK=0
+          for M in \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86" \
+            "https://github.com/aosp-mirror/platform_prebuilts_clang_host_linux-x86" ; do
+            echo "try $M"
+            rm -rf clang-tc
+            if git clone --depth 1 -b main "$M" clang-tc 2>&1 | tail -2; then
+              if ls clang-tc/clang-r*/bin/clang >/dev/null 2>&1; then OK=1; break; fi
+            fi
+          done
+          if [ "$OK" != "1" ]; then echo "!! clang fetch failed"; exit 1; fi
+          CLANG=$(ls $HOME/tc/clang-tc/clang-r*/bin/clang | sort | tail -1)
+          echo "CLANG=$CLANG"
+          echo "CLANG_DIR=$(dirname $CLANG)" >> $GITHUB_ENV
+          $CLANG --version | head -2
+
+      # ---------- 2. 取 ACK 源码 ----------
+      - name: '[2/7] Fetch ACK source'
+        run: |
+          set -e
+          mkdir -p $HOME/gki && cd $HOME/gki
+          git init -q common
+          cd common
+          git remote add origin https://android.googlesource.com/kernel/common
+          git fetch --depth=1 origin ${{ env.KERNEL_BRANCH }} 2>&1 | tail -3
+          git checkout -q FETCH_HEAD
+          echo "=== tree ==="
+          ls | head -25
+          echo "=== version ==="
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) =' Makefile | head -4
+          du -sh .
+          echo "SRC_DIR=$HOME/gki/common" >> $GITHUB_ENV
+
+      # ---------- 3. gki_defconfig + 严格 CFI ----------
+      - name: '[3/7] Configure with gki_defconfig + CFI'
+        run: |
+          set -e
+          export PATH="${{ env.CLANG_DIR }}:$PATH"
+          cd ${{ env.SRC_DIR }}
+          CLANG=${{ env.CLANG_DIR }}/clang
+
+          echo "=== gki_defconfig ==="
+          make ARCH=arm64 CC=$CLANG LLVM=1 gki_defconfig 2>&1 | tail -5
+
+          echo "=== force target config (match device kdev.config) ==="
+          CFG="./scripts/config --file .config"
+          # 模块相关
+          $CFG -e MODULES -e MODULE_UNLOAD -e MODVERSIONS
+          # 允许未签名
+          $CFG -d MODULE_SIG_FORCE
+          $CFG -e MODULE_SIG
+          # ★ CFI: 设备是 CFI_CLANG=y + LTO_NONE=y（Android 定制）
+          $CFG -e CFI_CLANG
+          $CFG -d CFI_PERMISSIVE
+          $CFG -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL
+          $CFG -e LTO_NONE
+          # 其他设备同款加固
+          $CFG -e ARM64_PTR_AUTH -e ARM64_PTR_AUTH_KERNEL -e ARM64_BTI
+          $CFG -e SHADOW_CALL_STACK
+          # localversion 对齐设备
+          $CFG --set-str LOCALVERSION "-android15-8-gc44b714366cc-abogki519650608-4k"
+          $CFG -d LOCALVERSION_AUTO
+          make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -3
+
+          echo "=== config self-check ==="
+          grep -E '^CONFIG_(CFI_CLANG|CFI_PERMISSIVE|LTO_NONE|LTO_CLANG|MODVERSIONS|MODULE_SIG_FORCE|SHADOW_CALL_STACK|ARM64_PTR_AUTH_KERNEL|ARM64_BTI)=' .config || true
+
+          echo "=== assert ==="
+          grep -q '^CONFIG_CFI_CLANG=y'   .config || { echo "!! CFI_CLANG missing"; exit 1; }
+          grep -q '^CONFIG_LTO_NONE=y'    .config || { echo "!! LTO_NONE missing"; exit 1; }
+          grep -q '^CONFIG_MODVERSIONS=y' .config || { echo "!! MODVERSIONS missing"; exit 1; }
+          echo "OK: all assert passed"
+
+      # ---------- 4. 完整编译 vmlinux（关键） ----------
+      - name: '[4/7] Full build vmlinux + modules'
+        run: |
+          set -e
+          export PATH="${{ env.CLANG_DIR }}:$PATH"
+          cd ${{ env.SRC_DIR }}
+          CLANG=${{ env.CLANG_DIR }}/clang
+          echo "=== build Image + modules (full, may take 2h) ==="
+          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 \
+            Image modules 2>&1 | tail -60
+          echo "=== artifacts ==="
+          ls -la arch/arm64/boot/Image
+          ls -la vmlinux 2>/dev/null || echo "no vmlinux"
+          ls -la Module.symvers
+          wc -l Module.symvers
+
+      # ---------- 5. 提取 kCFI typeid 表 ----------
+      - name: '[5/7] Extract kCFI typeid table'
+        run: |
+          set -e
+          cd ${{ env.SRC_DIR }}
+          echo "=== kcfi_typeid in vmlinux symbols ==="
+          grep -c 'kcfi_typeid' Module.symvers || echo "0 in symvers"
+          echo "=== kcfi_typeid in vmlinux binary ==="
+          # vmlinux 是 ELF，直接 readelf
+          readelf -sW vmlinux 2>/dev/null | grep -a 'kcfi_typeid' | head -10 || echo "none in vmlinux"
+          echo "--- count ---"
+          readelf -sW vmlinux 2>/dev/null | grep -ac 'kcfi_typeid' || echo "0"
+          echo "=== module_layout CRC ==="
+          grep -a ' module_layout' Module.symvers || echo "no module_layout"
+          grep -a ' _printk$' Module.symvers || echo "no _printk"
+          echo "=== save typeid table ==="
+          readelf -sW vmlinux 2>/dev/null | grep -a 'kcfi_typeid' > /tmp/typeid_vmlinux.txt || true
+          wc -l /tmp/typeid_vmlinux.txt
+
+      # ---------- 6. 编一个 hello 模块验证 typeid 是否产生 ----------
+      - name: '[6/7] Build test module (check typeid generated)'
+        run: |
+          set -e
+          export PATH="${{ env.CLANG_DIR }}:$PATH"
+          CLANG=${{ env.CLANG_DIR }}/clang
+          mkdir -p /tmp/hm && cd /tmp/hm
+          cat > hello.c <<'EOF'
+          #include <linux/module.h>
+          #include <linux/kernel.h>
+          static int (*fn_ptr)(const char *, ...) = printk;
+          static int __init h_init(void)
+          {
+            pr_info("hello kcfi test\n");
+            fn_ptr("indirect call via %p\n", fn_ptr);
+            return 0;
+          }
+          static void __exit h_exit(void) { }
+          module_init(h_init);
+          module_exit(h_exit);
+          MODULE_LICENSE("GPL");
+          EOF
+          cat > Makefile <<'EOF'
+          obj-m := hello.o
+          ccflags-y += -fsanitize=kcfi
+          ccflags-y += -Wno-unused-command-line-argument
+          EOF
+          make -C ${{ env.SRC_DIR }} M=/tmp/hm ARCH=arm64 CC=$CLANG LLVM=1 \
+            KBUILD_MODPOST_WARN=1 modules 2>&1 | tail -20
+          echo "=== hello.ko typeid ==="
+          readelf -sW hello.ko 2>/dev/null | grep -a 'kcfi_typeid' || echo "NONE (bad)"
+          echo "--- count ---"
+          readelf -sW hello.ko 2>/dev/null | grep -ac 'kcfi_typeid' || echo "0"
+          echo "=== vermagic ==="
+          readelf -p .modinfo hello.ko 2>/dev/null | grep -a vermagic || true
+          cp hello.ko /tmp/hello_kcfi.ko
+
+      # ---------- 7. 上传 ----------
+      - name: '[7/7] Upload artifacts'
+        uses: actions/upload-artifact@v4
+        with:
+          name: gki-kcfi-build
+          path: |
+            /tmp/hello_kcfi.ko
+            /tmp/typeid_vmlinux.txt
+            ${{ env.SRC_DIR }}/Module.symvers
+            ${{ env.SRC_DIR }}/arch/arm64/boot/Image
+          retention-days: 7
+          if-no-files-found: warn
