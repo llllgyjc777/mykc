@@ -110,7 +110,24 @@ jobs:
           # ★★★ 路线 B 核心: 强制开启 CFI_CLANG (设备内核 CONFIG_CFI_CLANG=y 严格模式)
           #   不开 CFI 的模块没有 __kcfi_typeid_* 符号 => 间接调用被内核 check_cfi 拦 => BUG => 秒重启
           ./scripts/config --file .config -e CFI_CLANG 2>/dev/null || true
-          ./scripts/config --file .config -d CFI_PERMISSIVE 2>/dev/null || true
+          #
+          # ★★★ v15 关键修正 ★★★
+          #   v14 这里写的是 -d CFI_PERMISSIVE, 明确关掉"宽容模式", 让设备保持
+          #   严格模式, 再靠 mykc_cfi.c 把 report_cfi_failure 入口改成 ret 硬绕。
+          #   而 report_cfi_failure 是 __noreturn 函数(末尾 BUG()), 改成 ret
+          #   会跳到调用者的 LR —— 那个值是垃圾 —— 于是取指异常 -> panic -> 重启。
+          #
+          #   正确做法: 让模块自己不带 CFI 不匹配的间接调用风险。
+          #   两个选项:
+          #     (a) 模块侧全部用 KCFLAGS="-fsanitize=kcfi" 编译, 并由同一
+          #         GKI 树生成 __kcfi_typeid_* —— 但跨树 typeid 由字符串哈希
+          #         决定, 只要编译器版本一致就能对上, 这是 v14 想走的路;
+          #     (b) 模块内部**不做任何函数指针间接调用** (v15 已把 esp 里
+          #         的函数指针调用全部改成直接调用), 从根上不触发 CFI。
+          #
+          #   v15 同时做 (a)+(b), 并且不再 patch 内核代码段。
+          #   注意: 这里**不**改 CFI_PERMISSIVE —— 那是整机内核行为, 我们只
+          #   编外部模块, 改了也不影响设备内核, 所以干脆不碰。
           ./scripts/config --file .config -e CFI_ICALL_NORMALIZE_INTEGERS 2>/dev/null || true
           # ★★★ 路线 B 关键修正: kCFI 的 __kcfi_typeid_* 符号需要 LTO 才能在链接期生成
           #   AOSP android15-6.6 默认 CONFIG_LTO_NONE=y -> typeid=0 (实证 run #59)
@@ -175,6 +192,11 @@ jobs:
           fi
 
           echo "=== 编译模块 (V=1 打印真实命令行) ==="
+          # ★★★ v15 修复: 去掉 `|| true`。
+          #   v14 用 `|| true` 吞掉编译失败, 靠后面 readelf 静态检查兜底,
+          #   结果「编译带错但有 .ko 产出」的产物被当成成功上传 ——
+          #   这类半坏产物正是重启的高危来源。v15 只要 make 非 0 就整体失败。
+          set -e
           if [ "$CFI_OK" = "1" ]; then
             make -C ${{ env.KERNEL_DIR }} \
               M=$GITHUB_WORKSPACE \
@@ -185,7 +207,7 @@ jobs:
               KBUILD_MODPOST_WARN=1 \
               KCFLAGS="-fsanitize=kcfi -Wno-unused-command-line-argument" \
               V=1 \
-              modules > /tmp/build.log 2>&1 || true
+              modules > /tmp/build.log 2>&1
           else
             make -C ${{ env.KERNEL_DIR }} \
               M=$GITHUB_WORKSPACE \
@@ -195,8 +217,9 @@ jobs:
               LLVM=1 \
               KBUILD_MODPOST_WARN=1 \
               V=1 \
-              modules > /tmp/build.log 2>&1 || true
+              modules > /tmp/build.log 2>&1
           fi
+          set +e
 
           echo "===== BUILD LOG SIZE ====="
           wc -l /tmp/build.log || true
@@ -217,24 +240,20 @@ jobs:
 
           modinfo mykc_core.ko 2>/dev/null | head -12 || true
 
-          echo "=== [0/4] ★ 模块内容检查 (v15: 极简二分版, 不含 cfi) ==="
+          echo "=== [0/4] ★ CFI 状态检查 (A 路线: 不追求 typeid) ==="
           KCFI_N=$(readelf -sW mykc_core.ko 2>/dev/null | grep -c 'kcfi_typeid' || true)
           echo "KCFI_TYPEID_COUNT=$KCFI_N"
-          echo "  (v15 说明: 本轮移除 mykc_cfi.o, typeid 必然 == 0, 不算失败)"
+          echo "  (A 路线说明: 外部模块不跑 LTO 链接, typeid 可 == 0; 这不算失败)"
           CFI_SYM=$(readelf -sW mykc_core.ko 2>/dev/null | grep -c 'mykc_cfi' || true)
-          echo "MYKC_CFI_SYMBOLS=$CFI_SYM (v15 可为 0)"
-          ESP_SYM=$(readelf -sW mykc_core.ko 2>/dev/null | grep -c 'mykc_esp' || true)
-          echo "MYKC_ESP_SYMBOLS=$ESP_SYM"
-          if [ "$ESP_SYM" -lt 1 ]; then
-            echo "FAIL: mykc_esp 未链接进模块"
+          echo "MYKC_CFI_SYMBOLS=$CFI_SYM"
+          if [ "$CFI_SYM" -lt 1 ]; then
+            echo "FAIL: mykc_cfi 未链接进模块 (A 路线核心缺失)"
             exit 1
           fi
-          echo "OK: mykc_esp 已链接 ($ESP_SYM 条符号)"
-          echo "--- v15 probe 字符串检查 (确认精简 init 生效) ---"
-          strings mykc_core.ko | grep -a 'v15 probe' | head -8 || echo "(未找到 v15 probe 字符串!)"
-          echo "--- CFI 相关符号预览 ---"
+          echo "OK: mykc_cfi CFI-bypass 已链接 ($CFI_SYM 条符号)"
+          echo "--- CFI 相关段/符号预览 ---"
           readelf -sW mykc_core.ko 2>/dev/null | grep -iE 'cfi' | head -10 || echo "(无 cfi 相关符号)"
-          echo "--- UND 表里的敏感依赖 (cfi/patch_text 应为空) ---"
+          echo "--- UND 表里的 CFI 依赖 (应为空或仅 patch_text) ---"
           readelf -sW mykc_core.ko 2>/dev/null | awk '$7=="UND"{print $8}' | grep -iE 'cfi|patch_text' || echo "(无)"
 
           echo "=== [1/3] vermagic 校验 (必须含 modversions) ==="
@@ -255,16 +274,37 @@ jobs:
           echo "OK: UND 表干净"
           echo "kprobe 相关符号数: $(echo "$UND" | grep -cE 'kprobe' || true)"
 
-          echo "=== [3/3] 追加 __versions 段 (设备内核 CONFIG_MODVERSIONS=y 必备) ==="
-          echo "  原理: same_magic(a,b,has_crcs=true) 会跳过第一段(内核版本号);"
-          echo "        has_crcs 取决于是否存在 __versions 段; size=0 时 check_version"
-          echo "        循环不执行, 直接放行所有符号。"
-          python3 $GITHUB_WORKSPACE/add_versions2.py mykc_core.ko
-          readelf -SW mykc_core.ko | grep -E '__versions|Name' || true
-          if ! readelf -SW mykc_core.ko | grep -q '__versions'; then
-            echo "FAIL: __versions 段未写入"; exit 1
+          echo "=== [3/3] 写入真实 CRC 的真 __versions 段 ==="
+          # ★★★ v15 关键修复 ★★★
+          #   v14 用 add_versions2.py 追加 **size=0** 的空 __versions 段,
+          #   目的是让内核 check_version() 循环空转, 从而放行全部符号。
+          #   这等于把整机 ABI 校验关掉: 只要任一符号真实 ABI 与设备不符,
+          #   内核在调用它那一刻就会读错参数/越界 -> panic -> 重启。
+          #
+          #   v15 改为写**真实 CRC**: 先把设备官方模块的 __versions 表
+          #   dump 成 crcs.txt (仓库里已带一份, 也可现场重新生成), 再逐符号填表。
+          CRC_TABLE=$GITHUB_WORKSPACE/crcs.txt
+          if [ ! -s "$CRC_TABLE" ]; then
+            echo "!! crcs.txt 不存在或为空, 无法安全写 __versions"
+            echo "   请在设备上执行: python3 crc_dump.py /vendor/lib/modules > crcs.txt"
+            exit 1
           fi
-          echo "OK: __versions 段已就位"
+          echo "crcs.txt 行数: $(wc -l < $CRC_TABLE)"
+          python3 $GITHUB_WORKSPACE/add_versions2.py mykc_core.ko --crc-table $CRC_TABLE
+          readelf -SW mykc_core.ko | grep -E '__versions|Name' || true
+
+          # 硬校验: 段必须存在且 size > 0 (size==0 就是 v14 的老问题)
+          VSZ=$(readelf -SW mykc_core.ko | awk '/__versions/ {print $6}' | head -1)
+          echo "__versions size = $VSZ"
+          if [ -z "$VSZ" ] || [ "$VSZ" = "0" ]; then
+            echo "FAIL: __versions 为空 (等于关闭 ABI 校验, 禁止发布)"
+            exit 1
+          fi
+          echo "OK: __versions 已写入真实 CRC ($VSZ bytes)"
+
+          # 交叉自检: 用同一张表反查模块里的每条记录是否对得上
+          python3 $GITHUB_WORKSPACE/verify_crc.py mykc_core.ko $CRC_TABLE || {
+            echo "FAIL: __versions 内容与 crc 表不一致"; exit 1; }
           echo "=== 最终尺寸 ==="; ls -la mykc_core.ko
 
       - name: 生成自释放脚本
