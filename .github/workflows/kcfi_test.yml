@@ -1,0 +1,157 @@
+name: kCFI Emission Test
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/kcfi_test.yml'
+      - 'hello_kcfi.c'
+
+env:
+  KBRANCH: android15-6.6
+
+jobs:
+  kcfi-test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      - name: '[0/6] Checkout repo (for hello_kcfi.c)'
+        uses: actions/checkout@v4
+
+      - name: '[1/6] Dependencies'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            cpio gzip xz-utils git curl python3 rsync binutils
+          echo OK
+
+      - name: '[2/6] Fetch Android clang'
+        run: |
+          set -e
+          mkdir -p $HOME/tc && cd $HOME/tc
+          OK=0
+          for M in \
+            "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86" \
+            "https://github.com/aosp-mirror/platform_prebuilts_clang_host_linux-x86" ; do
+            echo "try $M"
+            rm -rf clang-tc
+            if git clone --depth 1 -b main "$M" clang-tc 2>&1 | tail -2; then
+              if ls clang-tc/clang-r*/bin/clang >/dev/null 2>&1; then OK=1; break; fi
+            fi
+          done
+          [ "$OK" = "1" ] || { echo "!! clang fetch failed"; exit 1; }
+          CLANG=$(ls $HOME/tc/clang-tc/clang-r*/bin/clang | sort | tail -1)
+          echo "CLANG_DIR=$(dirname $CLANG)" >> $GITHUB_ENV
+          $CLANG --version | head -2
+
+      - name: '[3/6] Fetch ACK source'
+        run: |
+          set -e
+          mkdir -p $HOME/gki && cd $HOME/gki
+          git init -q common && cd common
+          git remote add origin https://android.googlesource.com/kernel/common
+          git fetch --depth=1 origin ${{ env.KBRANCH }} 2>&1 | tail -3
+          git checkout -q FETCH_HEAD
+          echo "SRC_DIR=$HOME/gki/common" >> $GITHUB_ENV
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile | head -3
+
+      - name: '[4/6] Configure + FULL build (vmlinux)'
+        run: |
+          set -e
+          export PATH="${{ env.CLANG_DIR }}:$PATH"
+          cd ${{ env.SRC_DIR }}
+          CLANG=${{ env.CLANG_DIR }}/clang
+
+          make ARCH=arm64 CC=$CLANG LLVM=1 gki_defconfig 2>&1 | tail -3
+          CFG="./scripts/config --file .config"
+          $CFG -e MODULES -e MODULE_UNLOAD -e MODVERSIONS
+          $CFG -d MODULE_SIG_FORCE ; $CFG -e MODULE_SIG
+          $CFG -e CFI_CLANG ; $CFG -d CFI_PERMISSIVE
+          $CFG -d LTO_CLANG -d LTO_CLANG_THIN -d LTO_CLANG_FULL ; $CFG -e LTO_NONE
+          $CFG --set-str LOCALVERSION "-android15-8-gc44b714366cc-abogki519650608-4k"
+          $CFG -d LOCALVERSION_AUTO
+          make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -3
+
+          echo "=== ASSERT ==="
+          grep -q '^CONFIG_CFI_CLANG=y'    .config || { echo "!! no CFI"; exit 1; }
+          grep -q '^CONFIG_LTO_NONE=y'     .config || { echo "!! no LTO_NONE"; exit 1; }
+          grep -q '^CONFIG_MODVERSIONS=y'  .config || { echo "!! no MODVERSIONS"; exit 1; }
+          grep -E '^CONFIG_(CFI_CLANG|CFI_PERMISSIVE|LTO_NONE|LTO_CLANG)=' .config
+          echo "ASSERT OK"
+
+          echo "=== FULL BUILD (this is the point) ==="
+          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 Image modules 2>&1 | tail -15
+
+          echo "=== ARTIFACTS ==="
+          ls -la vmlinux arch/arm64/boot/Image Module.symvers
+          echo "=== autoconf CFI check (KEY) ==="
+          grep -E 'CONFIG_(CFI_CLANG|LTO_NONE)' include/generated/autoconf.h || echo "!! not in autoconf"
+
+      - name: '[5/6] Build hello_kcfi module + 3-way judge'
+        run: |
+          export PATH="${{ env.CLANG_DIR }}:$PATH"
+          CLANG=${{ env.CLANG_DIR }}/clang
+          SRC=${{ env.SRC_DIR }}
+          mkdir -p /tmp/hm && cd /tmp/hm
+          cp $GITHUB_WORKSPACE/hello_kcfi.c hello_kcfi.c
+          printf 'obj-m := hello_kcfi.o\n' > Makefile
+
+          echo "=== ATTEMPT 1: ccflags-y ==="
+          echo 'ccflags-y += -fsanitize=kcfi' >> Makefile
+          make -C $SRC M=/tmp/hm ARCH=arm64 CC=$CLANG LLVM=1 modules 2>&1 | tail -8
+          if [ -f hello_kcfi.ko ]; then
+            echo "--- JUDGE A: typeid symbols ---"
+            readelf -sW hello_kcfi.ko | grep -c 'kcfi_typeid' || true
+            echo "--- JUDGE B: kcfi in text ---"
+            objdump -d hello_kcfi.ko 2>/dev/null | grep -ci 'kcfi\\|cfi_check' || true
+            echo "--- JUDGE C: dump first bytes of init ---"
+            objdump -d hello_kcfi.ko 2>/dev/null | grep -A25 '<hk_init>:' | head -30
+            cp hello_kcfi.ko /tmp/ko_ccflags.ko
+          else
+            echo "!! attempt1 no ko"
+          fi
+
+          echo "=== ATTEMPT 2: KCFLAGS (force) ==="
+          rm -f hello_kcfi.o hello_kcfi.ko
+          make -C $SRC M=/tmp/hm ARCH=arm64 CC=$CLANG LLVM=1 \
+            KCFLAGS="-fsanitize=kcfi" V=1 modules 2>&1 | grep -a 'hello_kcfi.c' | head -3
+          make -C $SRC M=/tmp/hm ARCH=arm64 CC=$CLANG LLVM=1 \
+            KCFLAGS="-fsanitize=kcfi" modules 2>&1 | tail -5
+          if [ -f hello_kcfi.ko ]; then
+            echo "--- JUDGE A2: typeid symbols ---"
+            readelf -sW hello_kcfi.ko | grep -c 'kcfi_typeid' || true
+            echo "--- JUDGE B2: kcfi in text ---"
+            objdump -d hello_kcfi.ko 2>/dev/null | grep -ci 'kcfi\\|cfi_check' || true
+            echo "--- JUDGE C2: hk_init disasm ---"
+            objdump -d hello_kcfi.ko 2>/dev/null | grep -A25 '<hk_init>:' | head -30
+            cp hello_kcfi.ko /tmp/ko_kcflags.ko
+          else
+            echo "!! attempt2 no ko"
+          fi
+
+          echo "=== VERMAGIC / UND ==="
+          for f in /tmp/ko_ccflags.ko /tmp/ko_kcflags.ko; do
+            [ -f $f ] || continue
+            echo "--- $f ---"
+            readelf -p .modinfo $f | grep -a vermagic || true
+            readelf -sW $f | grep -a ' UND ' | awk '{print $8}' | tr '\\n' ' '
+            echo
+          done
+
+      - name: '[5b] Reference: paradise66.ko typeid values'
+        run: |
+          echo "=== reference from repo (if available) ==="
+          ls -la $GITHUB_WORKSPACE/*.ko 2>/dev/null || echo "no ko in repo"
+
+      - name: '[6/6] Upload'
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kcfi-test-result
+          path: |
+            /tmp/ko_ccflags.ko
+            /tmp/ko_kcflags.ko
+            ${{ env.SRC_DIR }}/Module.symvers
+          retention-days: 7
+          if-no-files-found: warn
