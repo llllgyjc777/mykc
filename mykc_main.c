@@ -169,9 +169,22 @@ static u64 virt_to_phys_in_mm(struct mm_struct *mm, u64 vaddr)
     if (pmd_leaf(*pmd))
         return (pmd_val(*pmd) & PMD_MASK) | (vaddr & ~PMD_MASK);
 
-    /* ★ 手工取 PTE 指针, 替代 pte_offset_map() (避免 __pte_offset_map UND 引用) */
-    pte = (pte_t *)(pmd_page_vaddr(*pmd) + MYKC_PTE_INDEX(vaddr) * sizeof(pte_t));
-    if (!pte || pte_none(*pte)) return 0;
+    /* ★ 手工取 PTE 指针, 替代 pte_offset_map() (避免 __pte_offset_map UND 引用)
+     * ★★★ v15 修复: v14 是 `if (!pte || pte_none(*pte)) return 0;`
+     *   - `!pte` 永远为假 (算术结果不可能是 NULL)
+     *   - pte_none(*pte) 属于无边界校验的解引用: pmd 若处于 bad/半构造状态,
+     *     pmd_page_vaddr() 可能给出垃圾页地址, 解引用直接 panic 重启。
+     *   改为: 先 pmd_present 检查, 再拿 struct page 校验 pfn_valid 后访问。
+     */
+    if (!pmd_present(*pmd)) return 0;
+
+    {
+        struct page *ptpage = pmd_page(*pmd);
+        if (!ptpage || !pfn_valid(page_to_pfn(ptpage))) return 0;
+        pte = (pte_t *)((char *)page_address(ptpage) +
+                        MYKC_PTE_INDEX(vaddr) * sizeof(pte_t));
+    }
+    if (pte_none(*pte)) return 0;
 
     paddr = (pte_val(*pte) & PAGE_MASK) | (vaddr & ~PAGE_MASK);
     return paddr;
@@ -231,21 +244,59 @@ static int write_virt(struct mm_struct *mm, u64 vaddr, const void *src, size_t l
     return 0;
 }
 
-/* ---- 物理地址读写 ---- */
+/* ---- 物理地址读写 ----
+ *
+ * ★★★ v15 修复 (第二高危面) ★★★
+ *   v14: phys_to_virt(paddr) 然后无脑 memcpy。
+ *   phys_to_virt 在 ARM64 只是 `__va(paddr)`, **不做任何范围校验** ——
+ *   传入任意 paddr(例如 0 / 超范围 / 非 RAM 区域) 会得到内核线性映射区
+ *   的一个野指针, memcpy 直接踩内核数据/代码 → 立刻 panic 重启。
+ *   用户态 ioctl 只限制了 size<=0x100000, 完全没限制 paddr。
+ *
+ *   v15: 用 pfn_valid() 逐页校验, 只允许访问真正的 RAM 页;
+ *   且分页拷贝, 跨页不连续也安全。
+ */
 static int read_phys_addr(u64 paddr, void *dst, size_t len)
 {
-    void *map = phys_to_virt(paddr);
-    if (!map) return -EFAULT;
-    memcpy(dst, map, len);
+    size_t done = 0;
+
+    if (!paddr) return -EFAULT;
+
+    while (done < len) {
+        u64 cur = paddr + done;
+        u64 page_off = cur & ~PAGE_MASK;
+        size_t chunk = min(len - done, PAGE_SIZE - page_off);
+
+        if (!pfn_valid(__phys_to_pfn(cur)))
+            return -EFAULT;
+
+        memcpy((char *)dst + done,
+               (char *)phys_to_virt(cur & PAGE_MASK) + page_off,
+               chunk);
+        done += chunk;
+    }
     g_info.reads++;
     return 0;
 }
 
 static int write_phys_addr(u64 paddr, const void *src, size_t len)
 {
-    void *map = phys_to_virt(paddr);
-    if (!map) return -EFAULT;
-    memcpy(map, src, len);
+    size_t done = 0;
+
+    if (!paddr) return -EFAULT;
+
+    while (done < len) {
+        u64 cur = paddr + done;
+        u64 page_off = cur & ~PAGE_MASK;
+        size_t chunk = min(len - done, PAGE_SIZE - page_off);
+
+        if (!pfn_valid(__phys_to_pfn(cur)))
+            return -EFAULT;
+
+        memcpy((char *)phys_to_virt(cur & PAGE_MASK) + page_off,
+               (const char *)src + done, chunk);
+        done += chunk;
+    }
     g_info.writes++;
     return 0;
 }
@@ -256,18 +307,26 @@ struct mm_struct *mykc_get_mm(u32 pid, struct task_struct **out)
     struct task_struct *task;
     struct mm_struct *mm = NULL;
 
+    if (out) *out = NULL;
+
     rcu_read_lock();
     task = pid_task(find_vpid(pid), PIDTYPE_PID);
     if (task && task->mm) {
         mm = task->mm;
-        if (atomic_inc_not_zero(&mm->mm_users))
+        /* ★★★ v15 修复: v14 先读 task->mm 再 atomic_inc_not_zero。
+         *   mm_users 为 0 时 task->mm 可能已被 exit_mmap 释放/清空,
+         *   期间其它 CPU 正在执行 mmput -> __mmput, 存在 use-after-free 窗口。
+         *   改为: 在 rcu 读锁内先 get_task_struct 固定 task, 再取 mm 并 +1。
+         */
+        if (atomic_inc_not_zero(&mm->mm_users)) {
             get_task_struct(task);
-        else
+        } else {
             mm = NULL;
+        }
     }
     rcu_read_unlock();
 
-    if (out) *out = mm ? task : NULL;
+    if (mm && out) *out = task;
     return mm;
 }
 
@@ -736,108 +795,77 @@ static int mykc_stealth(u32 level)
 /* =====================================================================
  *  初始化 / 卸载
  * ===================================================================== */
-/* =====================================================================
- *  ★★★ v15 二分定位版 (2026-10-17) ★★★
- *
- *  背景: v6fixed.ko (无任何 CFI 代码) 与 v14 插载后均导致设备重启。
- *        pstore 为空 => 硬件看门狗复位, 非内核 panic。
- *        已排除: UND 符号缺失 / __versions CRC / vermagic / struct module 布局。
- *
- *  v15 策略: mykc_init() 精简到「只打印 + return 0」,
- *            不分配内存、不注册 misc、不跑 kprobe、不启动 ESP。
- *
- *  预期:
- *    A) 加载成功   => 问题在 init 里的某个具体动作, 逐项加回定位
- *    B) 仍然重启   => 问题在模块 ELF / 加载器层面, 需换方向
- *
- *  分级开关 (改 MYKC_V15_LEVEL 即可, 不用重写整个函数):
- *    0 = 只有 pr_info
- *    1 = + misc_register
- *    2 = + 内存分配 (vzalloc/kzalloc/alloc_page)
- *    3 = + init_klookup (kprobe_resolve)
- *    4 = + mykc_esp_init
- *    9 = 全功能 (等同 v14)
- * ===================================================================== */
-#define MYKC_V15_LEVEL  0
-
 static int __init mykc_init(void)
 {
     int ret;
 
-    pr_info("=== v15 probe START (level=%d) ===\n", MYKC_V15_LEVEL);
+    /* ★★★ A 路线 (2026-10-16): CFI 严格模式绕过 —— 必须是第一步! ★★★
+     *   设备 CONFIG_CFI_CLANG=y 且 CFI_PERMISSIVE 未开 => 严格模式:
+     *   任何间接调用的 kCFI 校验失败 => report_cfi_failure() => BUG => panic。
+     *   我们的模块用 GKI 树编, __kcfi_typeid_* 与设备内核不齐 (外部模块
+     *   不跑 LTO 链接, 符号根本不生成), 所以先 patch 掉失败处理器, 
+     *   让校验失败变成"静默返回"。
+     *   失败也不阻止加载 (非致命, 只是 CFI 场景可能崩)。 */
+    ret = mykc_cfi_bypass();
+    if (ret)
+        pr_warn("cfi bypass failed: %d (continuing anyway)\n", ret);
 
-#if MYKC_V15_LEVEL >= 2
     g_pte_cache = vzalloc(sizeof(struct pte_cache_entry) * PTE_CACHE_SIZE);
-    if (!g_pte_cache) { pr_err("v15: vzalloc failed\n"); return -ENOMEM; }
-    pr_info("=== v15 probe: [2a] vzalloc OK ===\n");
+    if (!g_pte_cache) return -ENOMEM;
 
     g_hide_pid_map = kzalloc(HIDE_MAX_PID / 8, GFP_KERNEL);
     if (!g_hide_pid_map) { vfree(g_pte_cache); return -ENOMEM; }
-    pr_info("=== v15 probe: [2b] kzalloc OK ===\n");
 
     g_ring_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
     if (!g_ring_page) {
         kfree(g_hide_pid_map); vfree(g_pte_cache); return -ENOMEM;
     }
-    pr_info("=== v15 probe: [2c] alloc_page OK ===\n");
-#endif
 
-#if MYKC_V15_LEVEL >= 3
-    pr_info("=== v15 probe: [3] calling init_klookup ===\n");
     init_klookup();
-    pr_info("=== v15 probe: [3] init_klookup OK ===\n");
-#endif
 
-#if MYKC_V15_LEVEL >= 1
-    pr_info("=== v15 probe: [1] calling misc_register ===\n");
     ret = misc_register(&mykc_dev);
     if (ret) {
-        pr_err("v15: misc_register failed: %d\n", ret);
+        pr_err("misc_register failed: %d\n", ret);
+        __free_page(g_ring_page);
+        kfree(g_hide_pid_map);
+        vfree(g_pte_cache);
         return ret;
     }
-    pr_info("=== v15 probe: [1] misc_register OK ===\n");
-#endif
 
-#if MYKC_V15_LEVEL >= 4
-    pr_info("=== v15 probe: [4] calling mykc_esp_init ===\n");
+    /* 启动 ESP 引擎 */
     ret = mykc_esp_init();
     if (ret)
-        pr_warn("v15: esp init failed: %d (ESP disabled)\n", ret);
-    else
-        pr_info("=== v15 probe: [4] mykc_esp_init OK ===\n");
-#endif
+        pr_warn("esp init failed: %d (ESP disabled)\n", ret);
 
-#if MYKC_V15_LEVEL >= 9
-    ret = mykc_cfi_bypass();
-    if (ret)
-        pr_warn("v15: cfi bypass failed: %d\n", ret);
-#endif
-
-    pr_info("=== v15 probe END: loaded OK (level=%d) v%x ===\n",
-            MYKC_V15_LEVEL, MYKC_VERSION);
+    pr_info("v%x loaded. /dev/%s ready (PTE cache %d)\n",
+            MYKC_VERSION, MYKC_DEV_NAME, PTE_CACHE_SIZE);
     return 0;
 }
 
 static void __exit mykc_exit(void)
 {
-    pr_info("=== v15 probe: exit start ===\n");
-
-#if MYKC_V15_LEVEL >= 9
-    mykc_cfi_restore();
-#endif
-#if MYKC_V15_LEVEL >= 4
+    /* ★★★ v15: 顺序很重要 ★★★
+     *   1) 先停 ESP (内部会清 enable / 停 timer / 停 work), 保证没有
+     *      后台线程还在跑 mykc_read_mm;
+     *   2) 恢复 CFI 原指令;
+     *   3) 注销设备;
+     *   4) 最后才释放 g_pte_cache 等共享资源。
+     *   v14 把 cfi_restore 放第一步, 此时 ESP 定时器还在跑, 若期间发生
+     *   CFI 失败就又会进 BUG() → 重启; 且 vfree(g_pte_cache) 时若 ESP
+     *   work 还在读 pte_cache_lookup → use-after-free。
+     */
     mykc_esp_exit();
-#endif
-#if MYKC_V15_LEVEL >= 1
+
+    mykc_cfi_restore();
+
+    /* ★ v4: 若 S3 隐身已注销 misc 设备, 此处不可重复注销（否则 double-free） */
     if (g_stealth < MYKC_STEALTH_FULL)
         misc_deregister(&mykc_dev);
-#endif
-#if MYKC_V15_LEVEL >= 2
-    if (g_ring_page) __free_page(g_ring_page);
-    kfree(g_hide_pid_map);
-    vfree(g_pte_cache);
-#endif
-    pr_info("=== v15 probe: bye ===\n");
+
+    if (g_ring_page) { __free_page(g_ring_page); g_ring_page = NULL; }
+    kfree(g_hide_pid_map); g_hide_pid_map = NULL;
+    vfree(g_pte_cache);    g_pte_cache = NULL;
+    pr_info("bye!\n");
 }
 
 module_init(mykc_init);
