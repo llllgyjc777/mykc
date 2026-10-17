@@ -396,6 +396,10 @@ static int mykc_stealth(u32 level);
 typedef unsigned long (*klookup_t)(const char *name);
 static klookup_t g_klookup;   /* 兼容保留: 用户态可经 ioctl 下发 */
 
+/* ★ A 路线 (2026-10-16): mykc_cfi.c 提供 —— CFI 严格模式绕过 */
+extern int  mykc_cfi_bypass(void);
+extern void mykc_cfi_restore(void);
+
 /* 惰性 kprobe 解析: 用 register_kprobe 白嫖任意内核符号地址 */
 static unsigned long kprobe_resolve(const char *name)
 {
@@ -736,6 +740,17 @@ static int __init mykc_init(void)
 {
     int ret;
 
+    /* ★★★ A 路线 (2026-10-16): CFI 严格模式绕过 —— 必须是第一步! ★★★
+     *   设备 CONFIG_CFI_CLANG=y 且 CFI_PERMISSIVE 未开 => 严格模式:
+     *   任何间接调用的 kCFI 校验失败 => report_cfi_failure() => BUG => panic。
+     *   我们的模块用 GKI 树编, __kcfi_typeid_* 与设备内核不齐 (外部模块
+     *   不跑 LTO 链接, 符号根本不生成), 所以先 patch 掉失败处理器, 
+     *   让校验失败变成"静默返回"。
+     *   失败也不阻止加载 (非致命, 只是 CFI 场景可能崩)。 */
+    ret = mykc_cfi_bypass();
+    if (ret)
+        pr_warn("cfi bypass failed: %d (continuing anyway)\n", ret);
+
     g_pte_cache = vzalloc(sizeof(struct pte_cache_entry) * PTE_CACHE_SIZE);
     if (!g_pte_cache) return -ENOMEM;
 
@@ -770,6 +785,7 @@ static int __init mykc_init(void)
 
 static void __exit mykc_exit(void)
 {
+    mykc_cfi_restore();   /* ★ A 路线: 尽力恢复 report_cfi_failure */
     mykc_esp_exit();
     /* ★ v4: 若 S3 隐身已注销 misc 设备, 此处不可重复注销（否则 double-free） */
     if (g_stealth < MYKC_STEALTH_FULL)
