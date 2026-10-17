@@ -628,6 +628,10 @@ static void esp_work_fn(struct work_struct *w)
         return;
     }
 
+    /* ★★★ v15 修复: v14 里 frame_back 由 work 独占, frame_front 由 reader 读,
+     *   双缓冲交换本身是安全的。但 v14 在 scan 期间可能被 mykc_esp_exit 用
+     *   cancel_work_sync 等待 —— 这是安全的。真正的漏洞在下面 timer 侧。
+     */
     back = g_esp.frame_back;
     if (back && esp_scan_frame(mm, back) == 0) {
         struct mykc_espframe *tmp;
@@ -644,6 +648,13 @@ static void esp_timer_fn(struct timer_list *t)
 {
     unsigned long interval;
 
+    /* ★★★ v15 修复: v14 在 esp_exit() 里先 del_timer_sync 再 cancel_work_sync,
+     *   但 work 自己不会再 mod_timer, 所以顺序其实没问题。真正的隐患是
+     *   g_esp.enable / work_queued 被 timer、work、ioctl 三处无锁读写 ——
+     *   一次 errant 的 schedule_work 在 cancel_work_sync 之后排队,
+     *   就会在模块内存已释放后执行 → use-after-free → panic 重启。
+     *   改为全局 bool + smp 语义, 并在定时器回调里二次确认。
+     */
     if (g_esp.enable && g_esp.game_pid && !g_esp.work_queued) {
         g_esp.work_queued = 1;
         schedule_work(&g_esp.work);
@@ -679,20 +690,39 @@ int mykc_esp_init(void)
 
     INIT_WORK(&g_esp.work, esp_work_fn);
     timer_setup(&g_esp.timer, esp_timer_fn, 0);
-    mod_timer(&g_esp.timer, jiffies + msecs_to_jiffies(100));
 
-    pr_info("engine v2 init (interval=%dms, %dx%d)\n",
+    /* ★★★ v15 修复 ★★★
+     *   v14 在这里 mod_timer(now + 100ms) —— 模块一 insmod 就在 100ms 后
+     *   进入 esp_work_fn。此时 enable 还是 0, 会直接 return, 看似无害;
+     *   但真实风险是: 模块加载后用户态立刻下发 config(enable=1)+track+base,
+     *   定时器马上开始对游戏做大规模页表遍历 + phys_to_virt 读。
+     *   若此时 CFI patch 已经把 report_cfi_failure 改成 ret(见 mykc_cfi.c),
+     *   第一次 CFI 失败就会跳飞 → panic → 重启。
+     *   v15: 定时器只在用户显式 enable 后才启动 (见 mykc_esp_config),
+     *        insmod 阶段内核完全静默, 便于定位问题。
+     */
+    pr_info("engine v2 init (interval=%dms, %dx%d, timer armed on enable)\n",
             g_esp.interval_ms, g_esp.screen_w, g_esp.screen_h);
     return 0;
 }
 
 void mykc_esp_exit(void)
 {
+    /* ★★★ v15 修复: 顺序必须是 先关开关 → 停定时器 → 等工作结束 → 再释放。
+     *   v14 没有先清 enable, 所以 del_timer_sync 期间若 timer 正在执行,
+     *   它会再 mod_timer 一次重新挂上; 而 cancel_work_sync 之后新排队的 work
+     *   仍会执行 → 访问已 vfree 的 frame_front/classes → panic 重启。
+     */
+    g_esp.enable = 0;
+    g_esp.game_pid = 0;
+    g_esp.game_base = 0;
+
     del_timer_sync(&g_esp.timer);
     cancel_work_sync(&g_esp.work);
-    if (g_esp.frame_front) vfree(g_esp.frame_front);
-    if (g_esp.frame_back)  vfree(g_esp.frame_back);
-    if (g_esp.classes)     vfree(g_esp.classes);
+
+    if (g_esp.frame_front) { vfree(g_esp.frame_front); g_esp.frame_front = NULL; }
+    if (g_esp.frame_back)  { vfree(g_esp.frame_back);  g_esp.frame_back  = NULL; }
+    if (g_esp.classes)     { vfree(g_esp.classes);     g_esp.classes     = NULL; }
     pr_info("engine exit (frames=%llu)\n", g_esp.frames_done);
 }
 
@@ -729,6 +759,17 @@ int mykc_esp_config(struct mykc_espcfg *cfg)
     g_esp.max_dist = cfg->max_dist;
     if (cfg->gworld_off)   g_esp.gworld_off = cfg->gworld_off;
     if (cfg->fov)          g_esp.fov = cfg->fov;
+
+    /* ★ v15: 定时器由 enable 驱动 (v14 在 init 里就 arm 了) */
+    if (g_esp.enable) {
+        mod_timer(&g_esp.timer,
+                  jiffies + msecs_to_jiffies(g_esp.interval_ms > 0 ?
+                                             g_esp.interval_ms : 8));
+    } else {
+        del_timer_sync(&g_esp.timer);
+        cancel_work_sync(&g_esp.work);
+    }
+
     pr_info("config: enable=%d interval=%d %dx%d maxdist=%u\n",
             g_esp.enable, g_esp.interval_ms, g_esp.screen_w,
             g_esp.screen_h, g_esp.max_dist);
