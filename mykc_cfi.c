@@ -36,12 +36,18 @@
 #include <linux/string.h>
 #include <linux/kprobes.h>
 
-/* ★ 关键: aarch64_insn_patch_text_nosync 原型
- *   arch/arm64/include/asm/insn.h:
- *     int aarch64_insn_patch_text_nosync(void *addr, u32 insn);
- *   它是 EXPORT_SYMBOL_GPL, 设备 kallsyms 实测存在。
- *   注意: GPL-only, 本模块 MODULE_LICENSE("GPL") 即可用。 */
-extern int aarch64_insn_patch_text_nosync(void *addr, u32 insn);
+/* ★★★ 关键 (v13 修正, 2026-10-17 真机实证) ★★★
+ *   aarch64_insn_patch_text_nosync 虽然出现在 /proc/kallsyms (T, 全局文本符号),
+ *   但它 **没有 EXPORT_SYMBOL** —— 实证:
+ *     __ksymtab_aarch64_insn_patch_text*  => 不存在
+ *     __ksymtab_register_kprobe           => 存在 (对照)
+ *   直接 extern 调用 => insmod 报 ENOENT ("No such file or directory")。
+ *
+ *   解法: 用 register_kprobe 惰性解析出它的真实地址, 再用函数指针调用。
+ *         这也是我们模块已有的「kprobe 白嫖未导出符号」手法 (学 paradise)。
+ * ===================================================================== */
+typedef int (*patch_text_nosync_t)(void *addr, u32 insn);
+static patch_text_nosync_t g_patch_text_nosync;
 
 /* ARM64 指令编码 */
 #define ARM64_RET_INSN   0xd65f03c0u   /* ret */
@@ -64,6 +70,25 @@ static unsigned long cfi_kprobe_resolve(const char *name)
     addr = (unsigned long)kp.addr;
     unregister_kprobe(&kp);
     return addr;
+}
+
+/* ★ 惰性解析 patch_text 函数地址 (未导出, 只能用 kprobe 白嫖) */
+static int cfi_init_patch_fn(void)
+{
+    unsigned long a;
+
+    if (g_patch_text_nosync)
+        return 0;
+
+    a = cfi_kprobe_resolve("aarch64_insn_patch_text_nosync");
+    if (!a) {
+        pr_warn("cfi: cannot resolve aarch64_insn_patch_text_nosync\n");
+        return -ENOENT;
+    }
+
+    g_patch_text_nosync = (patch_text_nosync_t)a;
+    pr_info("cfi: patch fn @ %px\n", (void *)a);
+    return 0;
 }
 
 /* =====================================================================
@@ -109,7 +134,7 @@ static int cfi_patch_one(struct cfi_target *t)
         return 1;
     }
 
-    ret = aarch64_insn_patch_text_nosync((void *)t->addr, ARM64_RET_INSN);
+    ret = g_patch_text_nosync((void *)t->addr, ARM64_RET_INSN);
     if (ret) {
         pr_warn("cfi: patch %s failed: %d\n", t->name, ret);
         return ret;
@@ -141,6 +166,12 @@ int mykc_cfi_bypass(void)
     pr_info("cfi: === CFI bypass (A-route) start ===\n");
     pr_info("cfi: kernel has CFI_CLANG=y & PERMISSIVE=n => strict mode\n");
 
+    /* ★ 必须最先解析 patch 函数地址 (未导出符号, 只能 kprobe 白嫖) */
+    if (cfi_init_patch_fn() != 0) {
+        pr_err("cfi: abort, cannot get patch_text fn\n");
+        return -ENOENT;
+    }
+
     for (i = 0; i < ARRAY_SIZE(cfi_targets); i++) {
         int r = cfi_patch_one(&cfi_targets[i]);
         if (r == 0 || r == 1)
@@ -166,7 +197,7 @@ void mykc_cfi_restore(void)
 
         memcpy(&cur, (void *)t->addr, sizeof(cur));
         if (cur == ARM64_RET_INSN) {
-            aarch64_insn_patch_text_nosync((void *)t->addr, t->saved);
+            g_patch_text_nosync((void *)t->addr, t->saved);
             pr_info("cfi: restored %s -> %08x\n", t->name, t->saved);
         }
     }
