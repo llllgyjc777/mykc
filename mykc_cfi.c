@@ -1,32 +1,44 @@
-/* mykc_cfi.c —— CFI 严格模式绕过 (A 路线, 学 paradise 手法)
+/* mykc_cfi.c —— CFI 严格模式绕过 (v15, 修复关机重启)
  *
  * =====================================================================
  *  设备实证 (2026-10-16, /proc/kallsyms + /proc/config.gz 实查):
  *    CONFIG_CFI_CLANG=y
  *    # CONFIG_CFI_PERMISSIVE is not set       <-- 严格模式: 校验失败 => BUG => panic
- *    # CONFIG_LTO_CLANG_THIN is not set       <-- ★ 设备内核自己就没开 LTO!
+ *    # CONFIG_LTO_CLANG_THIN is not set
  *    CONFIG_SHADOW_CALL_STACK=y
  *
- *    T report_cfi_failure                    <-- ★ 目标存在
- *    T aarch64_insn_patch_text_nosync        <-- ★ patch 工具存在且已导出
- *    T aarch64_insn_patch_text               <-- 同上
+ *    T report_cfi_failure
+ *    T aarch64_insn_patch_text_nosync   (未 EXPORT, 需 kprobe 解析)
+ * =====================================================================
  *
- *  ==> 结论: typeid 与 LTO 无关 (设备内核没 LTO 照样跑 paradise 模块)。
- *      我们用 GKI 树编外部模块, __kcfi_typeid_* 与设备内核"种子"不齐 =>
- *      一执行间接调用就 CFI 失败。A 路线不追求生成 typeid, 而是
- *      **直接把 report_cfi_failure 的第一条指令改成 RET**, 失败即静默返回。
+ *  ★★★ v15 关键修复 (v14 关机重启的直接根因) ★★★
  *
- *  patch 流程 (paradise 手法):
- *      1. kprobe 惰性解析 report_cfi_failure 地址 (只用导出符号 register_kprobe)
- *      2. 读原第一条指令备份
- *      3. aarch64_insn_patch_text_nosync(addr, ARM64_RET)
- *      4. 校验写回成功
+ *   report_cfi_failure 的真实原型 (5.15+/6.x):
+ *       void report_cfi_failure(void *target, u64 pc, unsigned long typeid);
+ *   它是 __noreturn: 末尾 BUG() -> do_error_trap -> die -> 重启。
  *
- *  ★ 与 v1 草稿的修正:
- *      - ARM64_NOP 宏去掉非法后缀 'u'
- *      - 只 patch 真实存在的 report_cfi_failure (删掉不存在的 __cfi_slowpath 等)
- *      - 改用 patch_text_nosync(单指令版), 签名简单无歧义
- *      - 移除 extern mykc_klookup (mykc_main.c 里只有 static, 会 UND)
+ *   v14 的做法是把入口第一条指令改成 `ret` (0xd65f03c0)。
+ *   ARM64 的 `ret` 跳的是 LR = x30。而调用者 __cfi_slowpath_diag 是
+ *   按「永不返回」编译的, 现场 x30 是任意值 / 旧的调用者地址,
+ *   于是 ret 跳到一个无意义地址 -> 取指异常 / 数据异常 ->
+ *   内核 panic -> 手机软重启。
+ *
+ *   实证吻合: 用户报「一 insmod 就关机重启」, 且本机 pstore
+ *   (console-ramoops-0) 只留下 panic 后的 console 尾部,
+ *   没有常规 Call trace 段落 —— 与「ret 跳到非法地址导致二次异常」一致。
+ *
+ *   v15 改为「静默返回而不是 BUG」:
+ *     在入口处写两条指令:
+ *         mov w0, #0     (0x52800000)
+ *         ret            (0xd65f03c0)
+ *     第二条 ret 执行时, LR 已被第 1 条之前的原序言? 不 —— 入口已被
+ *     完全覆盖, 所以 LR 仍是调用者的返回地址, 这是正确的。
+ *     语义等价于 CONFIG_CFI_PERMISSIVE=y: 校验失败只记录不 panic。
+ *
+ *   ★ 更安全的做法:
+ *     用 Makefile 的 CONFIG_CFI_PERMISSIVE=y 重新编译内核, 或让模块
+ *     走 kCFI 兼容编译。本 patch 是外部模块兜底, 默认关闭
+ *     (MYKC_CFI_BYPASS 宏控制)。
  * =====================================================================
  */
 #define pr_fmt(fmt) "[mykc] " fmt
@@ -36,24 +48,20 @@
 #include <linux/string.h>
 #include <linux/kprobes.h>
 
-/* ★★★ 关键 (v13 修正, 2026-10-17 真机实证) ★★★
- *   aarch64_insn_patch_text_nosync 虽然出现在 /proc/kallsyms (T, 全局文本符号),
- *   但它 **没有 EXPORT_SYMBOL** —— 实证:
- *     __ksymtab_aarch64_insn_patch_text*  => 不存在
- *     __ksymtab_register_kprobe           => 存在 (对照)
- *   直接 extern 调用 => insmod 报 ENOENT ("No such file or directory")。
- *
- *   解法: 用 register_kprobe 惰性解析出它的真实地址, 再用函数指针调用。
- *         这也是我们模块已有的「kprobe 白嫖未导出符号」手法 (学 paradise)。
- * ===================================================================== */
+/* ★ v15: 默认关闭 CFI patch。设为 1 才启用 (风险自担)。 */
+#ifndef MYKC_CFI_BYPASS
+#define MYKC_CFI_BYPASS 0
+#endif
+
 typedef int (*patch_text_nosync_t)(void *addr, u32 insn);
 static patch_text_nosync_t g_patch_text_nosync;
 
 /* ARM64 指令编码 */
+#define ARM64_MOV_W0_0   0x52800000u   /* mov w0, #0 */
 #define ARM64_RET_INSN   0xd65f03c0u   /* ret */
 
 /* =====================================================================
- *  符号解析: 独立实现, 不依赖 mykc_main.c 的 static 函数
+ *  符号解析
  * ===================================================================== */
 static unsigned long cfi_kprobe_resolve(const char *name)
 {
@@ -72,7 +80,6 @@ static unsigned long cfi_kprobe_resolve(const char *name)
     return addr;
 }
 
-/* ★ 惰性解析 patch_text 函数地址 (未导出, 只能用 kprobe 白嫖) */
 static int cfi_init_patch_fn(void)
 {
     unsigned long a;
@@ -92,28 +99,50 @@ static int cfi_init_patch_fn(void)
 }
 
 /* =====================================================================
- *  目标表: 只保留设备实证存在的符号
+ *  目标表
  * ===================================================================== */
 struct cfi_target {
     const char *name;
     unsigned long addr;
-    u32 saved;
+    u32 saved[2];      /* v15: 备份两指令 */
     int patched;
 };
 
 static struct cfi_target cfi_targets[] = {
-    { .name = "report_cfi_failure" },   /* ★ 主目标 (kallsyms 实证 T) */
+    { .name = "report_cfi_failure" },
 };
 
+/* =====================================================================
+ *  v15: 验证「首指令像不像真正的函数序言」
+ *     防止 kprobe 解析出的地址偏移 4/8 字节 -> patch 到别的函数中间
+ * ===================================================================== */
+static int cfi_verify_prologue(u32 insn)
+{
+    switch (insn) {
+    case 0xa9bf7bfdu:   /* stp x29,x30,[sp,#-16]! */
+    case 0xa9be7bfdu:   /* stp x29,x30,[sp,#-32]! */
+    case 0xa9bd7bfdu:   /* stp x29,x30,[sp,#-48]! */
+    case 0xa9bc7bfdu:   /* stp x29,x30,[sp,#-64]! */
+    case 0xd503233fu:   /* paciasp */
+    case 0xd503237fu:   /* pacibsp */
+    case 0xd65f03c0u:   /* 已经是 ret */
+        return 0;
+    default:
+        break;
+    }
+    /* sub sp, sp, #imm  (0xd10xxxxx 系列) */
+    if ((insn & 0xffc003ffu) == 0xd10003ffu)
+        return 0;
+    return -EINVAL;
+}
+
 /*
- * patch 单个目标: 把入口第一条指令改成 RET
- *   返回: 0 = 本次成功 patch
- *         1 = 已经是 RET (之前 patch 过, 幂等)
- *        <0 = 失败
+ * patch 单个目标: 把入口改成  mov w0,#0 ; ret
+ *   返回: 0 = 本次成功   1 = 已 patch 过   <0 = 失败
  */
 static int cfi_patch_one(struct cfi_target *t)
 {
-    u32 cur;
+    u32 cur[2] = { 0, 0 };
     int ret;
 
     t->addr = cfi_kprobe_resolve(t->name);
@@ -124,49 +153,66 @@ static int cfi_patch_one(struct cfi_target *t)
 
     pr_info("cfi: %s @ %px\n", t->name, (void *)t->addr);
 
-    /* 备份原指令 */
-    memcpy(&t->saved, (void *)t->addr, sizeof(t->saved));
+    memcpy(t->saved, (void *)t->addr, sizeof(t->saved));
 
-    /* 幂等: 已是 RET 就跳过 */
-    if (t->saved == ARM64_RET_INSN) {
-        pr_info("cfi: %s already patched\n", t->name);
+    if (t->saved[0] == ARM64_MOV_W0_0 && t->saved[1] == ARM64_RET_INSN) {
+        pr_info("cfi: %s already patched (v15 seq)\n", t->name);
         t->patched = 1;
         return 1;
     }
 
-    ret = g_patch_text_nosync((void *)t->addr, ARM64_RET_INSN);
+    if (cfi_verify_prologue(t->saved[0]) != 0) {
+        pr_err("cfi: %s prologue mismatch (first insn = %08x), refuse to patch\n",
+               t->name, t->saved[0]);
+        t->addr = 0;
+        return -EINVAL;
+    }
+
+    ret = g_patch_text_nosync((void *)t->addr, ARM64_MOV_W0_0);
     if (ret) {
-        pr_warn("cfi: patch %s failed: %d\n", t->name, ret);
+        pr_warn("cfi: patch %s [0] failed: %d\n", t->name, ret);
+        return ret;
+    }
+    ret = g_patch_text_nosync((void *)(t->addr + 4), ARM64_RET_INSN);
+    if (ret) {
+        pr_warn("cfi: patch %s [1] failed: %d, rollback\n", t->name, ret);
+        g_patch_text_nosync((void *)t->addr, t->saved[0]);
         return ret;
     }
 
-    /* 校验 */
-    memcpy(&cur, (void *)t->addr, sizeof(cur));
-    if (cur != ARM64_RET_INSN) {
-        pr_warn("cfi: verify %s failed (got %08x, want %08x)\n",
-                t->name, cur, ARM64_RET_INSN);
+    memcpy(cur, (void *)t->addr, sizeof(cur));
+    if (cur[0] != ARM64_MOV_W0_0 || cur[1] != ARM64_RET_INSN) {
+        pr_warn("cfi: verify %s failed (%08x %08x)\n", t->name, cur[0], cur[1]);
+        g_patch_text_nosync((void *)t->addr, t->saved[0]);
+        g_patch_text_nosync((void *)(t->addr + 4), t->saved[1]);
         return -EIO;
     }
 
     t->patched = 1;
-    pr_info("cfi: patched %s -> RET (saved %08x)\n", t->name, t->saved);
+    pr_info("cfi: patched %s -> 'mov w0,#0; ret' (saved %08x %08x)\n",
+            t->name, t->saved[0], t->saved[1]);
     return 0;
 }
 
-/*
- * 主入口: 建议在 mykc_init() 最开头 (任何间接调用之前) 调用。
- *   返回 0 = 至少成功 patch 了一个目标
- *   返回 <0 = 全部失败
- */
+/* =====================================================================
+ *  对外入口
+ * ===================================================================== */
 int mykc_cfi_bypass(void)
 {
+    unsigned long probe;
     int ok = 0;
     unsigned int i;
 
-    pr_info("cfi: === CFI bypass (A-route) start ===\n");
-    pr_info("cfi: kernel has CFI_CLANG=y & PERMISSIVE=n => strict mode\n");
+    pr_info("cfi: === CFI status probe (v15) ===\n");
+    pr_info("cfi: kernel CFI_CLANG=y, PERMISSIVE=n => strict mode\n");
 
-    /* ★ 必须最先解析 patch 函数地址 (未导出符号, 只能 kprobe 白嫖) */
+#if !MYKC_CFI_BYPASS
+    /* 只探测, 不改内核代码段 —— 这是 v15 的默认行为 */
+    probe = cfi_kprobe_resolve("report_cfi_failure");
+    pr_info("cfi: MYKC_CFI_BYPASS=0 (probe only), report_cfi_failure @ %px\n",
+            (void *)probe);
+    return 0;
+#else
     if (cfi_init_patch_fn() != 0) {
         pr_err("cfi: abort, cannot get patch_text fn\n");
         return -ENOENT;
@@ -181,24 +227,28 @@ int mykc_cfi_bypass(void)
     pr_info("cfi: === bypass result: %d/%u patched ===\n",
             ok, (unsigned int)ARRAY_SIZE(cfi_targets));
     return ok > 0 ? 0 : -ENOENT;
+#endif
 }
 
-/* 卸载时恢复 (尽力而为; 内核通常不建议恢复已 patch 的 CFI 处理函数) */
+/* 卸载恢复: 两条指令一起还原 */
 void mykc_cfi_restore(void)
 {
     unsigned int i;
 
     for (i = 0; i < ARRAY_SIZE(cfi_targets); i++) {
         struct cfi_target *t = &cfi_targets[i];
-        u32 cur;
+        u32 cur[2];
 
-        if (!t->patched || !t->addr)
+        if (!t->patched || !t->addr || !g_patch_text_nosync)
             continue;
 
-        memcpy(&cur, (void *)t->addr, sizeof(cur));
-        if (cur == ARM64_RET_INSN) {
-            g_patch_text_nosync((void *)t->addr, t->saved);
-            pr_info("cfi: restored %s -> %08x\n", t->name, t->saved);
+        memcpy(cur, (void *)t->addr, sizeof(cur));
+        if (cur[0] == ARM64_MOV_W0_0 && cur[1] == ARM64_RET_INSN) {
+            g_patch_text_nosync((void *)t->addr, t->saved[0]);
+            g_patch_text_nosync((void *)(t->addr + 4), t->saved[1]);
+            pr_info("cfi: restored %s -> %08x %08x\n",
+                    t->name, t->saved[0], t->saved[1]);
         }
+        t->patched = 0;
     }
 }
