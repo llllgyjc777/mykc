@@ -1,0 +1,97 @@
+name: QEMU Kernel Verify
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'qemu/**'
+      - '.github/workflows/qemu_verify.yml'
+
+jobs:
+  qemu-test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+    steps:
+      # ---------- 0. 环境准备 ----------
+      - name: '[0/6] Env info'
+        run: |
+          set -e
+          echo "=== Host ==="
+          uname -a
+          nproc
+          free -h
+          df -h /
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            build-essential bc bison flex libssl-dev libelf-dev \
+            qemu-system-arm cpio gzip xz-utils git curl \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+          echo "=== Toolchain ==="
+          aarch64-linux-gnu-gcc --version | head -1
+          qemu-system-aarch64 --version | head -1
+
+      # ---------- 1. 取 ACK 内核源码 ----------
+      - name: '[1/6] Fetch ACK android15-6.6'
+        run: |
+          set -e
+          mkdir -p $GITHUB_WORKSPACE/kl
+          cd $GITHUB_WORKSPACE/kl
+          echo "=== Shallow clone android15-6.6 ==="
+          git init -q .
+          git remote add origin https://android.googlesource.com/kernel/common
+          git fetch --depth=1 origin android15-6.6 2>&1 | tail -5
+          git checkout -q FETCH_HEAD
+          echo "=== Source tree ==="
+          ls -la | head -20
+          echo "KVER_MAKE:"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) =' Makefile | head -3
+          du -sh .
+
+      # ---------- 2. 配置并编译 ARM64 virt 内核 ----------
+      - name: '[2/6] Build ARM64 virt kernel'
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/kl
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          echo "=== defconfig ==="
+          make -j$(nproc) defconfig 2>&1 | tail -3
+          echo "=== enable module unload + kallsyms + ext4 ==="
+          ./scripts/config --enable MODULES --enable MODULE_UNLOAD
+          ./scripts/config --enable KALLSYMS --enable KALLSYMS_ALL
+          ./scripts/config --enable DEBUG_INFO_NONE
+          ./scripts/config --enable VIRTIO --enable VIRTIO_MMIO
+          ./scripts/config --enable VIRTIO_BLK --enable VIRTIO_NET
+          ./scripts/config --enable SERIAL_AMBA_PL011 --enable SERIAL_AMBA_PL011_CONSOLE
+          ./scripts/config --enable EXT4_FS
+          ./scripts/config --enable MODVERSIONS
+          ./scripts/config --set-str BUILD_SALT ""
+          make olddefconfig 2>&1 | tail -3
+          echo "=== build kernel ==="
+          make -j$(nproc) Image 2>&1 | tail -25
+          echo "=== build modules ==="
+          make -j$(nproc) modules 2>&1 | tail -10
+          echo "=== result ==="
+          ls -la arch/arm64/boot/Image
+          ls -la Module.symvers 2>/dev/null || echo "NO Module.symvers"
+
+      # ---------- 3. 上传内核 Image ----------
+      - name: '[3/6] Upload kernel Image'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image
+          path: |
+            kl/arch/arm64/boot/Image
+            kl/Module.symvers
+          retention-days: 7
+
+      # ---------- 4. 打印关键信息 ----------
+      - name: '[4/6] Summary'
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE/kl
+          echo "=== kernel release ==="
+          make kernelrelease 2>/dev/null | tail -1
+          echo "=== layout CRC candidates ==="
+          grep -a ' module_layout$' Module.symvers || echo "no module_layout in symvers"
+          echo "=== done ==="
