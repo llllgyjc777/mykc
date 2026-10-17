@@ -736,64 +736,108 @@ static int mykc_stealth(u32 level)
 /* =====================================================================
  *  初始化 / 卸载
  * ===================================================================== */
+/* =====================================================================
+ *  ★★★ v15 二分定位版 (2026-10-17) ★★★
+ *
+ *  背景: v6fixed.ko (无任何 CFI 代码) 与 v14 插载后均导致设备重启。
+ *        pstore 为空 => 硬件看门狗复位, 非内核 panic。
+ *        已排除: UND 符号缺失 / __versions CRC / vermagic / struct module 布局。
+ *
+ *  v15 策略: mykc_init() 精简到「只打印 + return 0」,
+ *            不分配内存、不注册 misc、不跑 kprobe、不启动 ESP。
+ *
+ *  预期:
+ *    A) 加载成功   => 问题在 init 里的某个具体动作, 逐项加回定位
+ *    B) 仍然重启   => 问题在模块 ELF / 加载器层面, 需换方向
+ *
+ *  分级开关 (改 MYKC_V15_LEVEL 即可, 不用重写整个函数):
+ *    0 = 只有 pr_info
+ *    1 = + misc_register
+ *    2 = + 内存分配 (vzalloc/kzalloc/alloc_page)
+ *    3 = + init_klookup (kprobe_resolve)
+ *    4 = + mykc_esp_init
+ *    9 = 全功能 (等同 v14)
+ * ===================================================================== */
+#define MYKC_V15_LEVEL  0
+
 static int __init mykc_init(void)
 {
     int ret;
 
-    /* ★★★ A 路线 (2026-10-16): CFI 严格模式绕过 —— 必须是第一步! ★★★
-     *   设备 CONFIG_CFI_CLANG=y 且 CFI_PERMISSIVE 未开 => 严格模式:
-     *   任何间接调用的 kCFI 校验失败 => report_cfi_failure() => BUG => panic。
-     *   我们的模块用 GKI 树编, __kcfi_typeid_* 与设备内核不齐 (外部模块
-     *   不跑 LTO 链接, 符号根本不生成), 所以先 patch 掉失败处理器, 
-     *   让校验失败变成"静默返回"。
-     *   失败也不阻止加载 (非致命, 只是 CFI 场景可能崩)。 */
-    ret = mykc_cfi_bypass();
-    if (ret)
-        pr_warn("cfi bypass failed: %d (continuing anyway)\n", ret);
+    pr_info("=== v15 probe START (level=%d) ===\n", MYKC_V15_LEVEL);
 
+#if MYKC_V15_LEVEL >= 2
     g_pte_cache = vzalloc(sizeof(struct pte_cache_entry) * PTE_CACHE_SIZE);
-    if (!g_pte_cache) return -ENOMEM;
+    if (!g_pte_cache) { pr_err("v15: vzalloc failed\n"); return -ENOMEM; }
+    pr_info("=== v15 probe: [2a] vzalloc OK ===\n");
 
     g_hide_pid_map = kzalloc(HIDE_MAX_PID / 8, GFP_KERNEL);
     if (!g_hide_pid_map) { vfree(g_pte_cache); return -ENOMEM; }
+    pr_info("=== v15 probe: [2b] kzalloc OK ===\n");
 
     g_ring_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
     if (!g_ring_page) {
         kfree(g_hide_pid_map); vfree(g_pte_cache); return -ENOMEM;
     }
+    pr_info("=== v15 probe: [2c] alloc_page OK ===\n");
+#endif
 
+#if MYKC_V15_LEVEL >= 3
+    pr_info("=== v15 probe: [3] calling init_klookup ===\n");
     init_klookup();
+    pr_info("=== v15 probe: [3] init_klookup OK ===\n");
+#endif
 
+#if MYKC_V15_LEVEL >= 1
+    pr_info("=== v15 probe: [1] calling misc_register ===\n");
     ret = misc_register(&mykc_dev);
     if (ret) {
-        pr_err("misc_register failed: %d\n", ret);
-        __free_page(g_ring_page);
-        kfree(g_hide_pid_map);
-        vfree(g_pte_cache);
+        pr_err("v15: misc_register failed: %d\n", ret);
         return ret;
     }
+    pr_info("=== v15 probe: [1] misc_register OK ===\n");
+#endif
 
-    /* 启动 ESP 引擎 */
+#if MYKC_V15_LEVEL >= 4
+    pr_info("=== v15 probe: [4] calling mykc_esp_init ===\n");
     ret = mykc_esp_init();
     if (ret)
-        pr_warn("esp init failed: %d (ESP disabled)\n", ret);
+        pr_warn("v15: esp init failed: %d (ESP disabled)\n", ret);
+    else
+        pr_info("=== v15 probe: [4] mykc_esp_init OK ===\n");
+#endif
 
-    pr_info("v%x loaded. /dev/%s ready (PTE cache %d)\n",
-            MYKC_VERSION, MYKC_DEV_NAME, PTE_CACHE_SIZE);
+#if MYKC_V15_LEVEL >= 9
+    ret = mykc_cfi_bypass();
+    if (ret)
+        pr_warn("v15: cfi bypass failed: %d\n", ret);
+#endif
+
+    pr_info("=== v15 probe END: loaded OK (level=%d) v%x ===\n",
+            MYKC_V15_LEVEL, MYKC_VERSION);
     return 0;
 }
 
 static void __exit mykc_exit(void)
 {
-    mykc_cfi_restore();   /* ★ A 路线: 尽力恢复 report_cfi_failure */
+    pr_info("=== v15 probe: exit start ===\n");
+
+#if MYKC_V15_LEVEL >= 9
+    mykc_cfi_restore();
+#endif
+#if MYKC_V15_LEVEL >= 4
     mykc_esp_exit();
-    /* ★ v4: 若 S3 隐身已注销 misc 设备, 此处不可重复注销（否则 double-free） */
+#endif
+#if MYKC_V15_LEVEL >= 1
     if (g_stealth < MYKC_STEALTH_FULL)
         misc_deregister(&mykc_dev);
+#endif
+#if MYKC_V15_LEVEL >= 2
     if (g_ring_page) __free_page(g_ring_page);
     kfree(g_hide_pid_map);
     vfree(g_pte_cache);
-    pr_info("bye!\n");
+#endif
+    pr_info("=== v15 probe: bye ===\n");
 }
 
 module_init(mykc_init);
