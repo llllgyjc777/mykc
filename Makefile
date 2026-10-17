@@ -6,7 +6,7 @@
 # 方式 B: 用完整内核源码树
 
 obj-m += mykc_core.o
-mykc_core-objs := mykc_main.o mykc_esp.o
+mykc_core-objs := mykc_main.o mykc_esp.o mykc_cfi.o
 # ★ A 路线 (2026-10-16): mykc_cfi.o 提供 CFI 严格模式绕过
 #   原理: patch report_cfi_failure -> RET
 #   实证: 设备 CONFIG_CFI_CLANG=y 且 CFI_PERMISSIVE 未开; 设备内核自己
