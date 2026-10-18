@@ -141,6 +141,26 @@ jobs:
           ./scripts/config --file .config -d MODULE_SIG_PROTECT 2>/dev/null || true
           # 顺带把所有依赖 abi_symbollist.raw 的旁路项也关掉, 消除同类隐患
           ./scripts/config --file .config -d MODULE_DEBUG_AUTOLOAD_DUPS 2>/dev/null || true
+          # ============================================================
+          # ★★★ v22 核心修复 (v21 实证) ★★★
+          # v21 已编通全部 C 源码 (LD vmlinux.o / AR vmlinux.a 都过了),
+          # 但在 modpost 阶段倒下, 原话:
+          #   make[2]: *** No rule to make target 'abi_symbollist.raw',
+          #             needed by 'Module.symvers'.  Stop.
+          #   make[1]: *** [Makefile:1920: modpost] Error 2
+          # 根因 (kdev.config 实证):
+          #   CONFIG_TRIM_UNUSED_KSYMS=y
+          #   CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"
+          # 该文件是 Google 发 GKI 正式 tarball 才附带的内核导出符号白名单,
+          # aosp-mirror/kernel_common 的 git 树里没有, 也无规则可生成.
+          # 影响: 顶层 Makefile 的 Module.symvers 规则依赖它 => modpost 失败.
+          # 我们只需要 Module.symvers 用于编译期 modpost 符号校验,
+          # 不需要裁剪导出符号, 故直接关闭 (保留全部导出符号只会更宽松).
+          # ============================================================
+          ./scripts/config --file .config -d TRIM_UNUSED_KSYMS 2>/dev/null || true
+          ./scripts/config --file .config --set-str UNUSED_KSYMS_WHITELIST "" 2>/dev/null || true
+          echo "=== v22: TRIM_UNUSED_KSYMS 已关闭 ==="
+          grep -E '^CONFIG_(TRIM_UNUSED_KSYMS|UNUSED_KSYMS_WHITELIST)' .config || echo "  (两项均已消失, 符合预期)"
           echo "=== v21: MODULE_SIG_PROTECT 已关闭 (避免 abi_symbollist.raw 缺失) ==="
           grep -E '^CONFIG_(MODULE_SIG_PROTECT|MODULE_SIG|MODULE_SIG_FORCE)' .config || echo "  (MODULE_SIG_PROTECT 已不存在于 .config, 符合预期)"
           # ★ 核心: 开 MODVERSIONS -> vermagic 带 modversions 单词 (设备内核 CONFIG_MODVERSIONS=y)
@@ -225,6 +245,53 @@ jobs:
           echo "=== abi_symbollist.raw 相关规则自检 ==="
           if grep -q 'gki_module_unprotected.h' kernel/module/Makefile 2>/dev/null; then
             echo "  (Makefile 里仍有 gki_module 规则, 但 MODULE_SIG_PROTECT=n 后不会触发)"
+          fi
+
+          # ============================================================
+          # ★ v22 硬断言 + 保险丝: TRIM_UNUSED_KSYMS 必须已关
+          #   若 olddefconfig 又把它恢复 (Kconfig 有 default y), 则直接
+          #   给顶层 Makefile 打补丁, 摘掉 Module.symvers 对
+          #   abi_symbollist.raw 的依赖, 保证 modpost 一定能过.
+          # ============================================================
+          echo "=== v22 断言: TRIM_UNUSED_KSYMS / UNUSED_KSYMS_WHITELIST ==="
+          grep -E '^CONFIG_(TRIM_UNUSED_KSYMS|UNUSED_KSYMS_WHITELIST)' .config || echo "  (两项均不在 .config)"
+          FUSE=0
+          if grep -q '^CONFIG_TRIM_UNUSED_KSYMS=y' .config; then
+            echo "  !! TRIM_UNUSED_KSYMS 被 olddefconfig 恢复了 => 启用保险丝"
+            FUSE=1
+          fi
+          if grep -qE '^CONFIG_UNUSED_KSYMS_WHITELIST="abi_symbollist.raw"' .config; then
+            echo "  !! UNUSED_KSYMS_WHITELIST 被恢复成 abi_symbollist.raw => 启用保险丝"
+            FUSE=1
+          fi
+
+          # 无论断言结果如何, 都先检查 Makefile 里 Module.symvers 是否真的依赖
+          echo "=== 顶层 Makefile 中 abi_symbollist.raw 引用点 ==="
+          grep -n 'abi_symbollist' Makefile scripts/Makefile.modpost 2>/dev/null || echo "  (顶层无该引用)"
+
+          if [ "$FUSE" = "1" ]; then
+            echo "=== 保险丝: 给顶层 Makefile 摘掉 abi_symbollist.raw 依赖 ==="
+            cp -f Makefile Makefile.v22bak
+            # 把 ABI_SYMBOL_LIST / abi_symbollist.raw 的依赖与参数摘掉
+            sed -i 's|Module\.symvers: *abi_symbollist\.raw||g' Makefile
+            sed -i 's|ABI_SYMBOL_LIST=abi_symbollist\.raw||g' Makefile
+            sed -i 's|abi_symbollist\.raw||g' Makefile
+            echo "---- 补丁后 Makefile 中 abi_symbollist 引用 (应为空) ----"
+            grep -n 'abi_symbollist' Makefile || echo "  (已彻底移除)"
+            # modpost 的 Makefile 也查一遍
+            if [ -f scripts/Makefile.modpost ]; then
+              sed -i 's|abi_symbollist\.raw||g' scripts/Makefile.modpost
+              echo "---- scripts/Makefile.modpost 中引用 (应为空) ----"
+              grep -n 'abi_symbollist' scripts/Makefile.modpost || echo "  (已彻底移除)"
+            fi
+            # 清空 TRIM_UNUSED_KSYMS 的 whitelist 字符串, 让 makefile 的 ifneq 走不进去
+            ./scripts/config --file .config -d TRIM_UNUSED_KSYMS 2>/dev/null || true
+            ./scripts/config --file .config --set-str UNUSED_KSYMS_WHITELIST "" 2>/dev/null || true
+            make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -3
+            echo "---- 二次 olddefconfig 后状态 ----"
+            grep -E '^CONFIG_(TRIM_UNUSED_KSYMS|UNUSED_KSYMS_WHITELIST)' .config || echo "  (两项均不在)"
+          else
+            echo "  OK: TRIM_UNUSED_KSYMS 未恢复, 保险丝未启用"
           fi
 
 
