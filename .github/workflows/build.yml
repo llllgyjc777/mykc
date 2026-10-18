@@ -203,7 +203,6 @@ jobs:
             echo "!! 严重: CONFIG_LTO_NONE 未生效"; exit 1
           fi
           echo "OK: CONFIG_LTO_NONE=y"
-          fi
 
           # ============================================================
           # ★★★ v18 核心: 完整编 vmlinux (唯一能让 kCFI typeid 生效的方式) ★★★
