@@ -130,12 +130,21 @@ jobs:
           #   编外部模块, 改了也不影响设备内核, 所以干脆不碰。
           ./scripts/config --file .config -e CFI_ICALL_NORMALIZE_INTEGERS 2>/dev/null || true
           # ★★★ 路线 B 关键修正: kCFI 的 __kcfi_typeid_* 符号需要 LTO 才能在链接期生成
-          #   AOSP android15-6.6 默认 CONFIG_LTO_NONE=y -> typeid=0 (实证 run #59)
-          #   切到 ThinLTO (GKI 官方默认)
-          ./scripts/config --file .config -d LTO_NONE 2>/dev/null || true
-          ./scripts/config --file .config -e LTO_CLANG 2>/dev/null || true
-          ./scripts/config --file .config -e LTO_CLANG_THIN 2>/dev/null || true
+          # ============================================================
+          # ★★★ v17 修正 (实证 run 39045715936, 2026-10-17) ★★★
+          #   v16 把 LTO_NONE 切成 ThinLTO, 理由是"typeid 需要 LTO 才生成"。
+          #   这个结论是【错的】。实测证据:
+          #     CONFIG_CFI_CLANG=y + CONFIG_LTO_NONE=y + 完整编 vmlinux
+          #     => hello_kcfi.ko 生出 __kcfi_typeid__printk = 0xff4ef75c
+          #     => .init.text 首 4 字节 = a6c5b136 (真实 typeid 前缀)
+          #   所以 LTO 不是必要条件, 真正的必要条件是【完整编 vmlinux】。
+          #   设备内核就是 CONFIG_LTO_NONE=y, 改成 ThinLTO 反而让 ABI 不一致。
+          #   因此这里【保持 LTO_NONE】, 与设备完全对齐。
+          # ============================================================
+          ./scripts/config --file .config -d LTO_CLANG 2>/dev/null || true
+          ./scripts/config --file .config -d LTO_CLANG_THIN 2>/dev/null || true
           ./scripts/config --file .config -d LTO_CLANG_FULL 2>/dev/null || true
+          ./scripts/config --file .config -e LTO_NONE 2>/dev/null || true
           make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -3
           echo "=== .config 关键项自检 ==="
           grep -E '^CONFIG_(MODVERSIONS|MODULE_SIG|MODULE_SIG_FORCE|LOCALVERSION)' .config || true
@@ -148,22 +157,44 @@ jobs:
           else
             echo "OK: CONFIG_CFI_CLANG=y 已开启"
           fi
-          echo "=== LTO / CFI 最终状态自检 ==="
+          echo "=== LTO / CFI 最终状态自检 (v17: 必须 LTO_NONE) ==="
           grep -E '^CONFIG_(LTO_CLANG_THIN|LTO_CLANG_FULL|LTO_NONE|CFI_CLANG|CFI_PERMISSIVE|CFI_ICALL_NORMALIZE_INTEGERS)=' .config || true
-          if ! grep -q '^CONFIG_LTO_CLANG_THIN=y' .config; then
-            echo "!! 警告: CONFIG_LTO_CLANG_THIN 未生效 (typeid 可能仍为 0)"
-          else
-            echo "OK: CONFIG_LTO_CLANG_THIN=y (ThinLTO 已开, 可生成 kCFI typeid)"
+          if ! grep -q '^CONFIG_LTO_NONE=y' .config; then
+            echo "!! 严重: CONFIG_LTO_NONE 未生效 (设备内核是 LTO_NONE, 必须对齐)"; exit 1
           fi
+          echo "OK: CONFIG_LTO_NONE=y (与设备内核一致)"
 
-          echo "=== modules_prepare (只需头文件, 不编 vmlinux) ==="
-          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 modules_prepare 2>&1 | tail -10
-
-          echo "=== ★ 跳过 vmlinux ==="
-          echo "  理由(实证): v5 日志显示 vmlinux 编完只产出 vmlinux.symvers/System.map,"
-          echo "  并不生成模块用的 Module.symvers; 模块靠 KBUILD_MODPOST_WARN=1 兜底即可。"
-          echo "  符号是否正确导出, 在编译期无 Module.symvers 时本就无法校验,"
-          echo "  真正的把关点是真机 insmod(Unknown symbol 会立刻现形)。"
+          # ============================================================
+          # ★★★ v17 核心修正: 完整编 vmlinux ★★★
+          #
+          # 四天问题的【真正根因】就在原来这两行:
+          #     make ... [旧]mod_prepare
+          #     echo "=== [旧]跳过整核 ==="
+          #
+          # 原因: 旧写法只生成头文件, 不生成完整 autoconf.h 的
+          #   CFI 条目, 也不生成 Module.symvers。clang 看到 CFI 未启用
+          #   就【静默忽略】 -fsanitize=kcfi -> 产物 0 个 typeid -> 真机秒重启。
+          #
+          # 实测对照 (run 39045715936):
+          #   旧写法(只备头文件)   -> typeid = 0  (v15 结果)
+          #   make Image modules   -> typeid = 1  (hello_kcfi 结果) OK
+          #
+          # 代价: 编译时间 ~8 分钟 -> ~25 分钟。可接受。
+          # ============================================================
+          echo "=== 完整编译 vmlinux + modules (约 20~30 分钟) ==="
+          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 Image modules 2>&1 | tail -25
+          echo "=== vmlinux 产物确认 ==="
+          ls -la vmlinux arch/arm64/boot/Image Module.symvers 2>&1 || true
+          echo "=== Module.symvers 条目数 ==="
+          wc -l Module.symvers 2>&1 || true
+          echo "=== vmlinux 内 kCFI typeid 计数 (应 > 0) ==="
+          readelf -sW vmlinux 2>/dev/null | grep -c kcfi_typeid || echo 0
+          echo "=== autoconf.h 里的 CFI 项 ==="
+          grep -E 'CONFIG_(CFI_CLANG|LTO_NONE|MODVERSIONS)' include/generated/autoconf.h 2>/dev/null || true
+          if [ ! -f Module.symvers ]; then
+            echo "!! 严重: Module.symvers 未生成, 编译未真正完成"; exit 1
+          fi
+          echo "OK: 完整编译完成, Module.symvers 就绪"
 
       - name: 编译 + 打补丁 + 校验 mykc_core.ko
         run: |
