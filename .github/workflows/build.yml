@@ -238,6 +238,13 @@ jobs:
           ls -la *.ko 2>/dev/null || { echo "!! 无 .ko 产出"; exit 1; }
           if [ ! -f mykc_core.ko ]; then echo "!! mykc_core.ko 不存在"; exit 1; fi
 
+          # ★ v16: 最小探针模块也要过 CRC (用于逐层定位 insmod 崩溃点)
+          if [ ! -f mykc_probe.ko ]; then
+            echo "!! mykc_probe.ko 不存在 (Step 0 探针未编出)"
+            exit 1
+          fi
+          echo "OK: mykc_probe.ko 已产出 ($(wc -c < mykc_probe.ko) bytes)"
+
           modinfo mykc_core.ko 2>/dev/null | head -12 || true
 
           echo "=== [0/4] ★ CFI 状态检查 (A 路线: 不追求 typeid) ==="
@@ -307,6 +314,17 @@ jobs:
             echo "FAIL: __versions 内容与 crc 表不一致"; exit 1; }
           echo "=== 最终尺寸 ==="; ls -la mykc_core.ko
 
+          echo "=== [4/4] 给 mykc_probe.ko 也写入真实 CRC ==="
+          python3 $GITHUB_WORKSPACE/add_versions2.py mykc_probe.ko --crc-table $CRC_TABLE
+          PSZ=$(readelf -SW mykc_probe.ko | awk '/__versions/ {print $6}' | head -1)
+          echo "probe __versions size = $PSZ"
+          if [ -z "$PSZ" ] || [ "$PSZ" = "0" ]; then
+            echo "FAIL: mykc_probe.ko 的 __versions 为空"; exit 1
+          fi
+          python3 $GITHUB_WORKSPACE/verify_crc.py mykc_probe.ko $CRC_TABLE || {
+            echo "FAIL: mykc_probe.ko CRC 不一致"; exit 1; }
+          echo "OK: mykc_probe.ko 已就绪 ($(wc -c < mykc_probe.ko) bytes)"
+
       - name: 生成自释放脚本
         run: |
           cd $GITHUB_WORKSPACE
@@ -319,6 +337,13 @@ jobs:
           chmod 755 mykc.ko.sh
           echo "打包完成: $(wc -c < mykc.ko.sh) bytes"
 
+          # ★ v16: 探针模块的自释放脚本 (Step 0, 只有打印, 不碰内核)
+          printf '#!/bin/sh\n# mykc_probe self-extract + insmod\nset -e\nTMP=$(mktemp)\ntrap "rm -f \\"$TMP\\"" EXIT INT TERM\nbase64 -d <<'"'"'__MYKC_PROBE__'"'"' > "$TMP"\n' > mykc_probe.sh
+          base64 mykc_probe.ko >> mykc_probe.sh
+          printf '__MYKC_PROBE__\ninsmod "$TMP"\nif [ $? -eq 0 ]; then echo "mykc_probe STEP0 loaded OK"; else echo "FAILED"; exit 1; fi\n' >> mykc_probe.sh
+          chmod 755 mykc_probe.sh
+          echo "探针打包完成: $(wc -c < mykc_probe.sh) bytes"
+
       - name: 上传产物
         uses: actions/upload-artifact@v4
         with:
@@ -326,4 +351,6 @@ jobs:
           path: |
             mykc_core.ko
             mykc.ko.sh
+            mykc_probe.ko
+            mykc_probe.sh
           retention-days: 30
