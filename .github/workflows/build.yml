@@ -96,8 +96,28 @@ jobs:
           cd $HOME/gki/common
           CLANG=${{ env.CLANG_BIN }}
 
-          echo "=== gki_defconfig ==="
-          make ARCH=arm64 CC=$CLANG LLVM=1 gki_defconfig 2>&1 | tail -5
+          # ============================================================
+          # ★★★ v18 核心: 使用设备真实配置 kdev.config (而非 gki_defconfig) ★★★
+          #
+          # 根因 (v17 实证): gki_defconfig 与设备实际配置差异巨大
+          #   设备: KASAN=y + KASAN_HW_TAGS=y + KASAN_VMALLOC=y + KFENCE=y
+          #   云端 gki_defconfig: 全关
+          # 后果: struct page / task_struct / mm_struct / struct pid /
+          #       struct miscdevice 布局全部不同 => 19 个符号 CRC 对不上
+          #
+          # 解法: 直接用从设备 dump 出来的 kdev.config 当 .config
+          #   (仓库根目录 kdev.config, 7760 行, 来自 /proc/config.gz)
+          # ============================================================
+          echo "=== 使用设备真实配置 kdev.config ==="
+          if [ ! -f $GITHUB_WORKSPACE/kdev.config ]; then
+            echo "!! 严重: kdev.config 不存在于仓库根目录"; exit 1
+          fi
+          cp -f $GITHUB_WORKSPACE/kdev.config .config
+          echo "kdev.config 行数: $(wc -l < .config)"
+
+          # 逐项显式打印设备关键配置 (供日志核对)
+          echo "=== 设备关键配置 (来自 kdev.config) ==="
+          grep -E '^CONFIG_(KASAN|KASAN_HW_TAGS|KASAN_VMALLOC|KFENCE|MEMCG|MEMCG_KMEM|SLUB|HARDENED_USERCOPY|ARM64_4K_PAGES|ARM64_PA_BITS|SHADOW_CALL_STACK|CFI_CLANG|LTO_NONE|MODVERSIONS)=' .config || true
 
           # 允许未签名模块
           ./scripts/config --file .config -d MODULE_SIG_FORCE 2>/dev/null || true
@@ -131,24 +151,44 @@ jobs:
           ./scripts/config --file .config -e CFI_ICALL_NORMALIZE_INTEGERS 2>/dev/null || true
           # ★★★ 路线 B 关键修正: kCFI 的 __kcfi_typeid_* 符号需要 LTO 才能在链接期生成
           # ============================================================
-          # ★★★ v17 修正 (实证 run 39045715936, 2026-10-17) ★★★
-          #   v16 把 LTO_NONE 切成 ThinLTO, 理由是"typeid 需要 LTO 才生成"。
-          #   这个结论是【错的】。实测证据:
-          #     CONFIG_CFI_CLANG=y + CONFIG_LTO_NONE=y + 完整编 vmlinux
-          #     => hello_kcfi.ko 生出 __kcfi_typeid__printk = 0xff4ef75c
-          #     => .init.text 首 4 字节 = a6c5b136 (真实 typeid 前缀)
-          #   所以 LTO 不是必要条件, 真正的必要条件是【完整编 vmlinux】。
-          #   设备内核就是 CONFIG_LTO_NONE=y, 改成 ThinLTO 反而让 ABI 不一致。
-          #   因此这里【保持 LTO_NONE】, 与设备完全对齐。
+          # ★ v18: 保持 LTO_NONE, 与设备 kdev.config 完全一致
+          #   实证: CFI_CLANG=y + LTO_NONE=y + 完整编 vmlinux => typeid 正常生成
           # ============================================================
           ./scripts/config --file .config -d LTO_CLANG 2>/dev/null || true
           ./scripts/config --file .config -d LTO_CLANG_THIN 2>/dev/null || true
           ./scripts/config --file .config -d LTO_CLANG_FULL 2>/dev/null || true
           ./scripts/config --file .config -e LTO_NONE 2>/dev/null || true
-          make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -3
+          echo "=== olddefconfig 前 KASAN 状态 ==="
+          grep -E '^CONFIG_(KASAN|KASAN_HW_TAGS|KASAN_VMALLOC|KFENCE)=' .config || true
+          echo "=== olddefconfig ==="
+          make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -5
+          echo "=== olddefconfig 后 KASAN 状态 ==="
+          grep -E '^CONFIG_(KASAN|KASAN_HW_TAGS|KASAN_VMALLOC|KFENCE)=' .config || true
           echo "=== .config 关键项自检 ==="
           grep -E '^CONFIG_(MODVERSIONS|MODULE_SIG|MODULE_SIG_FORCE|LOCALVERSION)' .config || true
           grep -E '^CONFIG_(CFI_CLANG|CFI_PERMISSIVE|SHADOW_CALL_STACK|ARM64_PTR_AUTH_KERNEL)' .config || true
+          # ============================================================
+          # ★ v18: 硬断言 KASAN 全家桶必须保留 (决定 19 个 CRC 是否匹配)
+          # ============================================================
+          echo "=== KASAN 硬断言 ==="
+          KFAIL=0
+          for K in KASAN KASAN_HW_TAGS KASAN_VMALLOC KFENCE; do
+            if grep -q "^CONFIG_${K}=y" .config; then
+              echo "  OK: CONFIG_${K}=y"
+            else
+              echo "  !! 丢失: CONFIG_${K} (olddefconfig 可能不识别该项)"
+              KFAIL=1
+            fi
+          done
+          if [ "$KFAIL" = "1" ]; then
+            echo "!! 严重: KASAN 配置项在 olddefconfig 后丢失"
+            echo "   说明 ACK 开源树不支持这些项, 需要换策略"
+            echo "--- .config 中实际存在的 KASAN 行 ---"
+            grep -iE '^#? ?CONFIG_KASAN' .config || echo "  (完全不存在)"
+            exit 1
+          fi
+          echo "OK: KASAN 全家桶全部保留"
+
           if ! grep -q '^CONFIG_MODVERSIONS=y' .config; then
             echo "!! CONFIG_MODVERSIONS 未生效, 中止"; exit 1
           fi
@@ -157,31 +197,20 @@ jobs:
           else
             echo "OK: CONFIG_CFI_CLANG=y 已开启"
           fi
-          echo "=== LTO / CFI 最终状态自检 (v17: 必须 LTO_NONE) ==="
-          grep -E '^CONFIG_(LTO_CLANG_THIN|LTO_CLANG_FULL|LTO_NONE|CFI_CLANG|CFI_PERMISSIVE|CFI_ICALL_NORMALIZE_INTEGERS)=' .config || true
+          echo "=== LTO / CFI 最终状态自检 (v18: 必须 LTO_NONE) ==="
+          grep -E '^CONFIG_(LTO_CLANG_THIN|LTO_CLANG_FULL|LTO_NONE|CFI_CLANG|CFI_PERMISSIVE)=' .config || true
           if ! grep -q '^CONFIG_LTO_NONE=y' .config; then
-            echo "!! 严重: CONFIG_LTO_NONE 未生效 (设备内核是 LTO_NONE, 必须对齐)"; exit 1
+            echo "!! 严重: CONFIG_LTO_NONE 未生效"; exit 1
           fi
-          echo "OK: CONFIG_LTO_NONE=y (与设备内核一致)"
+          echo "OK: CONFIG_LTO_NONE=y"
+          fi
 
           # ============================================================
-          # ★★★ v17 核心修正: 完整编 vmlinux ★★★
-          #
-          # 四天问题的【真正根因】就在原来这两行:
-          #     make ... [旧]mod_prepare
-          #     echo "=== [旧]跳过整核 ==="
-          #
-          # 原因: 旧写法只生成头文件, 不生成完整 autoconf.h 的
-          #   CFI 条目, 也不生成 Module.symvers。clang 看到 CFI 未启用
-          #   就【静默忽略】 -fsanitize=kcfi -> 产物 0 个 typeid -> 真机秒重启。
-          #
-          # 实测对照 (run 39045715936):
-          #   旧写法(只备头文件)   -> typeid = 0  (v15 结果)
-          #   make Image modules   -> typeid = 1  (hello_kcfi 结果) OK
-          #
-          # 代价: 编译时间 ~8 分钟 -> ~25 分钟。可接受。
+          # ★★★ v18 核心: 完整编 vmlinux (唯一能让 kCFI typeid 生效的方式) ★★★
+          #   实证 run 39045715936: modules_prepare => typeid=0
+          #                        make Image modules => typeid=1
           # ============================================================
-          echo "=== 完整编译 vmlinux + modules (约 20~30 分钟) ==="
+          echo "=== 完整编译 vmlinux + modules (约 25~40 分钟) ==="
           make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 Image modules 2>&1 | tail -25
           echo "=== vmlinux 产物确认 ==="
           ls -la vmlinux arch/arm64/boot/Image Module.symvers 2>&1 || true
@@ -189,8 +218,6 @@ jobs:
           wc -l Module.symvers 2>&1 || true
           echo "=== vmlinux 内 kCFI typeid 计数 (应 > 0) ==="
           readelf -sW vmlinux 2>/dev/null | grep -c kcfi_typeid || echo 0
-          echo "=== autoconf.h 里的 CFI 项 ==="
-          grep -E 'CONFIG_(CFI_CLANG|LTO_NONE|MODVERSIONS)' include/generated/autoconf.h 2>/dev/null || true
           if [ ! -f Module.symvers ]; then
             echo "!! 严重: Module.symvers 未生成, 编译未真正完成"; exit 1
           fi
