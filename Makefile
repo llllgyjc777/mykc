@@ -7,6 +7,21 @@
 
 obj-m += mykc_core.o
 mykc_core-objs := mykc_main.o mykc_esp.o mykc_cfi.o
+
+# ★★★ v16 诊断用: 最小加载探针 ★★★
+#   v15 在用户设备上 insmod 即重启, 需要逐层定位是 init 路径哪一步炸的。
+#   mykc_probe.ko 用 MYKC_STEP 宏分 6 级逐渐放开功能:
+#     0 = 只打印 (最安全)
+#     1 = + vzalloc 128KB
+#     2 = + kzalloc 1KB
+#     3 = + alloc_page
+#     4 = + misc_register
+#     5 = + register_kprobe(report_cfi_failure)   <- 头号嫌疑
+#   用法: 改下面 MYKC_PROBE_STEP 的数值, 重新编译, 逐个试。
+MYKC_PROBE_STEP ?= 0
+obj-m += mykc_probe.o
+ccflags-mykc_probe.o := -DMYKC_STEP=$(MYKC_PROBE_STEP)
+ccflags-y += -Wno-unused-command-line-argument
 # ★ A 路线 (2026-10-16): mykc_cfi.o 提供 CFI 严格模式绕过
 #   原理: patch report_cfi_failure -> RET
 #   实证: 设备 CONFIG_CFI_CLANG=y 且 CFI_PERMISSIVE 未开; 设备内核自己
@@ -46,7 +61,6 @@ EXTRA_CFLAGS := -Wno-unused-variable -Wno-unused-function -Wno-format
 #   多了会因 -Werror,-Wunused-command-line-argument 直接编挂 —— 实证 run #56)
 # ★ 再补一个 -Wno-unused-command-line-argument 兜底, 防止其他 flag 重复时报错
 ccflags-y += -fsanitize=kcfi
-ccflags-y += -Wno-unused-command-line-argument
 
 all:
 	@echo "=== 编译 mykc_core.ko ==="
