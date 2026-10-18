@@ -235,6 +235,26 @@ jobs:
             tail -50 /tmp/kbuild.log || true
             echo "==================== 日志总行数 ===================="
             wc -l /tmp/kbuild.log || true
+            echo "==================== [D] 日志里所有 make[3]/make[4] 失败目录 ===================="
+            grep -aE 'make\[[34]\]: \*\*\*' /tmp/kbuild.log | head -20 || true
+            echo "==================== [E] kernel/module 源码目录实况 ===================="
+            ls -la kernel/module/ 2>&1 || true
+            echo "---- kernel/module/Makefile 内容 ----"
+            cat kernel/module/Makefile 2>&1 | head -60 || true
+            echo "==================== [F] kernel/module 单独重跑 (V=1, 抓真实错误) ===================="
+            set +e
+            make -j1 ARCH=arm64 CC=$CLANG LLVM=1 V=1 kernel/module/ > /tmp/kmod.log 2>&1
+            KM=$?
+            set -e
+            echo "---- kernel/module 重跑退出码: $KM ----"
+            echo "---- kernel/module 重跑日志行数 ----"
+            wc -l /tmp/kmod.log || true
+            echo "---- 含 error/fatal/No rule/No such 的行 ----"
+            grep -aE 'error|fatal|No rule|No such|undefined|Error [0-9]' /tmp/kmod.log | head -40 || true
+            echo "---- kernel/module 重跑日志最后 60 行 ----"
+            tail -60 /tmp/kmod.log || true
+            echo "==================== [G] kernel/module 相关 CONFIG ===================="
+            grep -E '^CONFIG_(MODULE|MODULES|MODULE_SIG|MODULE_COMPRESS|MODULE_DECOMPRESS|MODULE_UNLOAD|MODVERSIONS|MODULE_FORCE|MODULE_ALLOW)' .config | head -30 || true
             echo "!! 编译失败"; exit 1
           fi
           echo "==================== 编译成功, 日志末 20 行 ===================="
