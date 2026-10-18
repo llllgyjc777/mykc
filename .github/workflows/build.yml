@@ -210,7 +210,35 @@ jobs:
           #                        make Image modules => typeid=1
           # ============================================================
           echo "=== 完整编译 vmlinux + modules (约 25~40 分钟) ==="
-          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 Image modules 2>&1 | tail -25
+          set +e
+          make -j$(nproc) ARCH=arm64 CC=$CLANG LLVM=1 Image modules > /tmp/kbuild.log 2>&1
+          MK=$?
+          set -e
+          echo "=== make 退出码: $MK ==="
+          if [ "$MK" -ne 0 ]; then
+            echo "==================== [A] 所有 error 行 ===================="
+            grep -aE 'error:|fatal error:|Error [0-9]|No such file|undefined' /tmp/kbuild.log | head -60 || true
+            echo "==================== [B] 首个 error 上下文 ===================="
+            grep -a -n -m5 'error:' /tmp/kbuild.log > /tmp/errlines.txt || true
+            if [ -s /tmp/errlines.txt ]; then
+              cat /tmp/errlines.txt || true
+              F=$(head -1 /tmp/errlines.txt | cut -d: -f1)
+              echo "---- 首个 error 在第 $F 行, 前后上下文 ----"
+              S=$((F-5)); if [ "$S" -lt 1 ]; then S=1; fi
+              E=$((F+15))
+              awk -v s=$S -v e=$E 'NR>=s && NR<=e' /tmp/kbuild.log || true
+            else
+              echo "(无 'error:' 行, 打印最后 120 行)"
+              tail -120 /tmp/kbuild.log || true
+            fi
+            echo "==================== [C] 日志最后 50 行 ===================="
+            tail -50 /tmp/kbuild.log || true
+            echo "==================== 日志总行数 ===================="
+            wc -l /tmp/kbuild.log || true
+            echo "!! 编译失败"; exit 1
+          fi
+          echo "==================== 编译成功, 日志末 20 行 ===================="
+          tail -20 /tmp/kbuild.log || true
           echo "=== vmlinux 产物确认 ==="
           ls -la vmlinux arch/arm64/boot/Image Module.symvers 2>&1 || true
           echo "=== Module.symvers 条目数 ==="
