@@ -122,6 +122,27 @@ jobs:
           # 允许未签名模块
           ./scripts/config --file .config -d MODULE_SIG_FORCE 2>/dev/null || true
           ./scripts/config --file .config -e MODULE_SIG 2>/dev/null || true
+          # ============================================================
+          # ★★★ v21 核心修复 (v20 探针实证) ★★★
+          # 失败原话:
+          #   make[4]: *** No rule to make target 'abi_symbollist.raw',
+          #             needed by 'include/generated/gki_module_unprotected.h'. Stop.
+          # 原因: 设备 kdev.config 带 CONFIG_MODULE_SIG_PROTECT=y (GKI 签名保护),
+          #       它让 kernel/module/Makefile 去编 gki_module.o, 而 gki_module.o
+          #       依赖 gen_gki_modules_headers.sh 生成的
+          #         include/generated/gki_module_unprotected.h
+          #       该规则的 ALL_KMI_SYMBOLS 默认取 'abi_symbollist.raw',
+          #       这是 Google 发 GKI 内核时才附带的 ABI 白名单,
+          #       开源 aosp-mirror/kernel_common 树里并不存在 => 无规则可造 => Stop.
+          #       => 一个 .c 都没开始编, 所以日志里连一条 error: 都没有.
+          # 解法: 外部模块不需要设备内核的签名保护特性, 直接关闭该项.
+          #       (MODULE_SIG_FORCE 早已关闭, 不影响设备加载未签名模块)
+          # ============================================================
+          ./scripts/config --file .config -d MODULE_SIG_PROTECT 2>/dev/null || true
+          # 顺带把所有依赖 abi_symbollist.raw 的旁路项也关掉, 消除同类隐患
+          ./scripts/config --file .config -d MODULE_DEBUG_AUTOLOAD_DUPS 2>/dev/null || true
+          echo "=== v21: MODULE_SIG_PROTECT 已关闭 (避免 abi_symbollist.raw 缺失) ==="
+          grep -E '^CONFIG_(MODULE_SIG_PROTECT|MODULE_SIG|MODULE_SIG_FORCE)' .config || echo "  (MODULE_SIG_PROTECT 已不存在于 .config, 符合预期)"
           # ★ 核心: 开 MODVERSIONS -> vermagic 带 modversions 单词 (设备内核 CONFIG_MODVERSIONS=y)
           ./scripts/config --file .config -e MODVERSIONS 2>/dev/null || true
           # ★ 把 LOCALVERSION 对齐设备内核, 让 vermagic 第一段也一致 (双保险)
@@ -188,6 +209,24 @@ jobs:
             exit 1
           fi
           echo "OK: KASAN 全家桶全部保留"
+
+          # ============================================================
+          # ★ v21 硬断言: MODULE_SIG_PROTECT 必须已被 olddefconfig 拿掉
+          #   (若它还在, kernel/module 会再次去找 abi_symbollist.raw 而失败)
+          # ============================================================
+          echo "=== v21 断言: MODULE_SIG_PROTECT 状态 ==="
+          if grep -q '^CONFIG_MODULE_SIG_PROTECT=y' .config; then
+            echo "  !! 严重: olddefconfig 之后 MODULE_SIG_PROTECT 仍为 y"
+            echo "  !! 将再次触发 abi_symbollist.raw 缺失, 中止"
+            exit 1
+          else
+            echo "  OK: CONFIG_MODULE_SIG_PROTECT 不在 (已关闭)"
+          fi
+          echo "=== abi_symbollist.raw 相关规则自检 ==="
+          if grep -q 'gki_module_unprotected.h' kernel/module/Makefile 2>/dev/null; then
+            echo "  (Makefile 里仍有 gki_module 规则, 但 MODULE_SIG_PROTECT=n 后不会触发)"
+          fi
+
 
           if ! grep -q '^CONFIG_MODVERSIONS=y' .config; then
             echo "!! CONFIG_MODVERSIONS 未生效, 中止"; exit 1
