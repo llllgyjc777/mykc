@@ -42,7 +42,9 @@ static struct kprobe mp_kp = {
 
 static int __init mp_init(void)
 {
+#if MP_STEP >= 4
 	int ret = 0;
+#endif
 
 	pr_info(MP_TAG "loaded, step=%d, ver=%s\n", MP_STEP, mp_ver);
 
