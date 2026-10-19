@@ -1,0 +1,149 @@
+# build_mp.yml — 一次性编译 STEP 0~5 六个 mp.ko
+#
+# 放到仓库 .github/workflows/ 下，手动触发。
+# 产物: mp_s0.ko ~ mp_s5.ko 六个文件
+#
+# 目标内核: 6.6.118-android15-8-gc44b714366cc-abogki519650608-4k
+# KMI: android15-8 / Android 16 / kernel 6.6
+
+name: Build Minimal Probe (mp.ko STEP 0-5)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_branch:
+        description: 'GKI kernel branch'
+        required: false
+        default: 'android15-6.6'
+
+env:
+  KERNEL_REPO: 'https://android.googlesource.com/kernel/common'
+  KERNEL_BRANCH: ${{ github.event.inputs.kernel_branch }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- 安装依赖 ----------
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            bc bison flex libssl-dev libelf-dev \
+            cpio rsync zip unzip xz-utils \
+            python3 git make gcc
+
+      # ---------- 拉内核源码 ----------
+      - name: Clone kernel
+        run: |
+          git clone --depth=1 -b "$KERNEL_BRANCH" \
+            "$KERNEL_REPO" kernel_src 2>&1 | tail -5
+          echo "=== 内核版本 ==="
+          head -5 kernel_src/Makefile
+
+      # ---------- 下载 clang ----------
+      - name: Get clang
+        run: |
+          # 设备内核用 android clang 18 (r510928)；这里用 r510928 对齐
+          CLANG_URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r510928.tar.gz"
+          curl -sL "$CLANG_URL" -o clang.tar.gz || {
+            echo "!! 主源失败，换备用"
+            CLANG_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang+llvm-18.1.8-x86_64-linux-gnu-ubuntu-18.04.tar.xz"
+            curl -sL "$CLANG_URL" -o clang.tar.xz
+            tar xf clang.tar.xz
+            mv clang+llvm-* clang-tool
+            exit 0
+          }
+          mkdir -p clang-tool
+          tar xzf clang.tar.gz -C clang-tool
+          ./clang-tool/bin/clang --version | head -2
+
+      - name: Setup clang env
+        run: |
+          if [ -d clang-tool/bin ]; then
+            echo "$PWD/clang-tool/bin" >> $GITHUB_PATH
+            echo "CLANG_DIR=$PWD/clang-tool/bin" >> $GITHUB_ENV
+          fi
+          clang --version || { echo "!! clang 不可用"; exit 1; }
+
+      # ---------- 内核 defconfig (GKI) ----------
+      - name: Configure kernel
+        run: |
+          cd kernel_src
+          mkdir -p out
+          # GKI 用 defconfig，这里选 arm64 gki
+          make -C . O=out ARCH=arm64 \
+            CC=clang LD=ld.lld LLVM=1 \
+            gki_defconfig 2>&1 | tail -10 || {
+              echo "!! gki_defconfig 失败，试 defconfig"
+              make -C . O=out ARCH=arm64 CC=clang LD=ld.lld LLVM=1 defconfig 2>&1 | tail -10
+            }
+          echo "=== 关键配置 ==="
+          grep -E 'CONFIG_CFI_CLANG|CONFIG_CFI_PERMISSIVE|CONFIG_MODVERSIONS|CONFIG_LTO_CLANG' out/.config || true
+
+      # ---------- 生成 Module.symvers (关键!) ----------
+      - name: Build modules_prepare
+        run: |
+          cd kernel_src
+          make -C . O=out ARCH=arm64 \
+            CC=clang LD=ld.lld LLVM=1 \
+            modules_prepare 2>&1 | tail -15
+
+      # ---------- 编 6 个 STEP ----------
+      - name: Build mp.ko STEP 0-5
+        run: |
+          mkdir -p artifacts
+          cd minprobe 2>/dev/null || cd .
+          for STEP in 0 1 2 3 4 5; do
+            echo "=================== STEP=$STEP ==================="
+            make -C .. clean >/dev/null 2>&1 || true
+            rm -f mp.ko *.o .*.cmd 2>/dev/null || true
+
+            make -C ../kernel_src O=../kernel_src/out \
+              M="$PWD" \
+              ARCH=arm64 \
+              CC=clang LD=ld.lld LLVM=1 \
+              CLANG_TRIPLE=aarch64-linux-gnu- \
+              MP_STEP=$STEP \
+              modules 2>&1 | tail -8
+
+            if [ -f mp.ko ]; then
+              cp mp.ko "../artifacts/mp_s${STEP}.ko"
+              echo "OK: mp_s${STEP}.ko  $(wc -c < mp.ko) bytes"
+              echo "--- vermagic ---"
+              strings mp.ko | grep '^vermagic=' || echo "(no vermagic)"
+              echo "--- kCFI brk count (>0 = CFI 已启用) ---"
+              objdump -d mp.ko 2>/dev/null | grep -c 'brk.*0x8222' || echo 0
+            else
+              echo "!! STEP=$STEP 编译失败"
+            fi
+          done
+          ls -la ../artifacts/
+
+      # ---------- 产物自检 ----------
+      - name: Verify artifacts
+        run: |
+          echo "=== 产物清单 ==="
+          ls -la artifacts/
+          echo ""
+          for f in artifacts/*.ko; do
+            [ -f "$f" ] || continue
+            echo "--- $f ---"
+            echo -n "  size: "; stat -c%s "$f"
+            echo -n "  vermagic: "; strings "$f" | grep '^vermagic=' | head -1
+            echo -n "  kCFI brk: "; objdump -d "$f" 2>/dev/null | grep -c 'brk.*0x8222' || echo 0
+            echo -n "  UND count: "; readelf -sW "$f" 2>/dev/null | awk '$7=="UND"' | wc -l
+            echo -n "  md5: "; md5sum "$f" | cut -d' ' -f1
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mp-probes
+          path: artifacts/*.ko
+          if-no-files-found: error

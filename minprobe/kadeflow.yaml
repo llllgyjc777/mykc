@@ -1,0 +1,53 @@
+# kadeflow.yaml — 用 kade (systemnb/compile_android_driver) 编译 MYKC 模块
+#
+# 用法:
+#   1. 目录结构:
+#        code/            <- 把 mp.c 或 mykc_main.c/mykc_esp.c/mykc_cfi.c 放这里
+#        abi.symbols
+#        kadeflow.yaml
+#        .github/workflows/kade.yml
+#   2. 推到 GitHub，Actions 自动跑
+#
+# 目标设备: Redmi K80 Pro (miro / SM8750)
+#   Android 16 / SDK 36
+#   内核 6.6.118-android15-8-gc44b714366cc-abogki519650608-4k
+
+kade:
+  config_overrides:
+    kernel:
+      flavor: "gki"
+
+    gki:
+      # ★ 设备是 Android 16 / kernel 6.6，不是 13/5.15
+      android_version: 16
+      kernel_version: "6.6"
+      target_arch: "aarch64"
+
+      # 具体 KMI 版本，对应 android15-8
+      # 如果 kade 支持显式指定 KMI 分支，填这行；不支持就靠 android_version+kernel_version 推断
+      kmi: "android15-8"
+
+      driver:
+        project_name: "mykc"
+        in_tree: false
+        external_src_dir: "${GITHUB_WORKSPACE}/code"
+        # 验证阶段先编最小探针；确认装载 OK 再改成 mykc_core.ko
+        module_name: "mp.ko"
+        overwrite: true
+
+# ★ ABI 符号：模块需要从内核拿到的符号
+#   kade 会自动执行 kade abi_upstream + kade abi --file abi.symbols
+#   解决我们之前手动 patch vermagic / 找 CRC 真值的麻烦
+abi:
+  upstream_patch: true
+  symbols_file: "${GITHUB_WORKSPACE}/abi.symbols"
+
+# 构建后处理
+compile_commands:
+  enabled: true
+
+# 导出产物
+export:
+  paths:
+    - "*.ko"
+    - "compile_commands.json"

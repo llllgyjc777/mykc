@@ -1,0 +1,73 @@
+# abi.symbols — MYKC 模块需要从内核拿到的符号
+#
+# kade 会自动执行:
+#   kade abi_upstream
+#   kade abi --file abi.symbols
+# 把这些符号导出到 Module.symvers，解决「符号版本 CRC 对不上」的问题。
+#
+# 目标内核: 6.6.118-android15-8-gc44b714366cc-abogki519650608-4k
+
+# --- 基础模块设施 ---
+__this_module
+module_layout
+
+# --- 内存分配 ---
+vzalloc
+vfree
+kzalloc
+kfree
+alloc_pages
+__alloc_pages
+__free_pages
+
+# --- 符号解析（找内核函数地址） ---
+kallsyms_lookup_name
+kprobe_lookup_name
+
+# --- kprobe（用于 hook / CFI bypass） ---
+register_kprobe
+unregister_kprobe
+register_kprobe_on_func_entry
+
+# --- 代码段 patch（inline hook / CFI bypass 核心） ---
+aarch64_insn_patch_text_nosync
+aarch64_insn_patch_text
+
+# --- 设备注册 ---
+misc_register
+misc_deregister
+
+# --- 任务与内存管理（ESP 需要） ---
+find_task_by_vpid
+get_pid_task
+get_task_mm
+mmput
+find_get_pid
+put_pid
+pid_task
+
+# --- 定时器与工作队列（ESP 引擎） ---
+timer_setup
+mod_timer
+del_timer_sync
+timer_shutdown_sync
+schedule_work
+cancel_work_sync
+queue_work_on
+
+# --- 打印 ---
+printk
+_printk
+
+# --- 字符串与内存操作 ---
+strscpy
+memcpy
+memset
+snprintf
+scnprintf
+
+# --- 锁 ---
+_spin_lock
+_spin_unlock
+mutex_lock
+mutex_unlock
