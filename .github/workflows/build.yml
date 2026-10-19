@@ -85,18 +85,21 @@ jobs:
           ls -la "$CLANG_DIR"/ld.lld "$CLANG_DIR"/llvm-ar "$CLANG_DIR"/llvm-nm 2>&1 | head -6
           "$CLANG_DIR"/ld.lld --version 2>&1 | head -2
 
-      - name: 下载 GKI 内核源码 (KMI android15-6.6)
+      - name: 下载 GKI 内核源码 (6.6.118 android15-8 精确匹配)
         run: |
           set -o pipefail
           mkdir -p $HOME/gki && cd $HOME/gki
           OK=0
+          # v24: 使用 6.6.118 + android15-8 的精确匹配树
+          # 来源: Kernels-by-ravindu644/google_kernel_GKI-6.6.118-android15.8 (main 分支)
+          # 已核验: SUBLEVEL=118, android_kabi.h 存在, ANDROID_KABI_RESERVE x20
           for MIRROR in \
-            "https://github.com/aosp-mirror/kernel_common" \
-            "https://android.googlesource.com/kernel/common" ; do
+            "https://github.com/Kernels-by-ravindu644/google_kernel_GKI-6.6.118-android15.8" \
+            "https://github.com/Kernels-by-ravindu644/google_kernel_GKI-6.6.118-android15.8.git" ; do
             for TRY in 1 2 3; do
-              echo "--- gki mirror=$MIRROR try=$TRY ---"
+              echo "--- gki118 mirror=$MIRROR try=$TRY ---"
               rm -rf common
-              if git clone --depth 1 -b android15-6.6 "$MIRROR" common 2>&1 | tail -3; then
+              if git clone --depth 1 -b main "$MIRROR" common 2>&1 | tail -3; then
                 if [ -f common/Makefile ]; then OK=1; break; fi
               fi
               sleep 8
@@ -107,12 +110,25 @@ jobs:
           cd common
           echo "=== 内核版本 (原始) ==="
           head -5 Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL' || true
-          # ★★★ 路线 B 修正: AOSP android15-6.6 HEAD 是 6.6.111, 设备真实是 6.6.118
-          #   vermagic 第一段 6.6.xxx 必须精确匹配, 故直接 patch Makefile SUBLEVEL
+          # v24: 新树本身就是 6.6.118, 只需硬断言, 不再 patch
           ORIG_SUB=$(grep -E '^SUBLEVEL *=' Makefile | head -1 | sed 's/[^0-9]//g')
-          echo "ORIG_SUBLEVEL=$ORIG_SUB -> patch to 118"
-          sed -i 's/^SUBLEVEL *=.*/SUBLEVEL = 118/' Makefile
-          grep -E '^SUBLEVEL *=' Makefile | head -1
+          echo "ORIG_SUBLEVEL=$ORIG_SUB"
+          if [ "$ORIG_SUB" != "118" ]; then
+            echo "!! 严重: 树不是 6.6.118 (实际=$ORIG_SUB), 终止"
+            exit 1
+          fi
+          echo "OK: SUBLEVEL=118 匹配设备"
+          # 断言 Android KABI 存在
+          if [ ! -f include/linux/android_kabi.h ]; then
+            echo "!! 严重: android_kabi.h 缺失, 该树无 Android KABI 补丁"
+            exit 1
+          fi
+          KABI_CNT=$(grep -c 'ANDROID_KABI_RESERVE' include/linux/sched.h || true)
+          echo "OK: android_kabi.h 存在, sched.h 中 ANDROID_KABI_RESERVE=$KABI_CNT"
+          if [ "$KABI_CNT" -lt 10 ]; then
+            echo "!! 严重: ANDROID_KABI_RESERVE 数量异常 (<10)"
+            exit 1
+          fi
           echo "=== 内核版本 (patch 后) ==="
           head -5 Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL' || true
           echo "KERNEL_DIR=$HOME/gki/common" >> $GITHUB_ENV
