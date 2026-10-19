@@ -110,6 +110,21 @@ jobs:
           cd common
           echo "=== 内核版本 (原始) ==="
           head -5 Makefile | grep -E 'VERSION|PATCHLEVEL|SUBLEVEL' || true
+
+          # v24-fix: 这棵树的 drivers/Kconfig 引用了不存在的 drivers/kernelsu/Kconfig
+          # (submodule 实际在根目录 KernelSU-Next/), 会导致 olddefconfig 直接崩.
+          # 我们不需要 KernelSU, 删掉该 source 行即可.
+          if [ -f drivers/Kconfig ]; then
+            echo "=== 修复 drivers/Kconfig 的 kernelsu 引用 ==="
+            grep -n 'drivers/kernelsu/Kconfig' drivers/Kconfig || echo "  (无该引用)"
+            sed -i '/source "drivers\/kernelsu\/Kconfig"/d' drivers/Kconfig
+            echo "--- 修复后检查 ---"
+            grep -n 'kernelsu' drivers/Kconfig || echo "  OK: 已无 kernelsu 引用"
+          fi
+          # 同时把根目录 KernelSU-Next 目录移走, 避免 Kbuild 递归进入
+          if [ -d KernelSU-Next ]; then
+            echo "  (KernelSU-Next 目录存在, 保留不影响, 因为未被 Kconfig 引用)"
+          fi
           # v24: 新树本身就是 6.6.118, 只需硬断言, 不再 patch
           ORIG_SUB=$(grep -E '^SUBLEVEL *=' Makefile | head -1 | sed 's/[^0-9]//g')
           echo "ORIG_SUBLEVEL=$ORIG_SUB"
