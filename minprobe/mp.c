@@ -1,20 +1,4 @@
-// mp.c — MYKC 最小装载验证模块
-// 目的：判断 .ko 装载失败到底出在「编译链/工具链/CRC/vermagic」还是「mykc 具体代码」
-//
-// 设计原则（按 STEP 逐级放开，默认 STEP=0 最安全）：
-//   STEP 0 : 只有 pr_info，init 立即返回 0。无任何分配、无函数指针调用。
-//   STEP 1 : + vzalloc 16KB 然后 vfree
-//   STEP 2 : + kzalloc 1KB 然后 kfree
-//   STEP 3 : + alloc_page 然后 __free_page
-//   STEP 4 : + misc_register / misc_deregister
-//   STEP 5 : + register_kprobe(report_cfi_failure) —— 头号嫌疑项
-//
-// 判定方法：
-//   STEP 0 能装载   -> 编译链 OK，问题在 mykc 代码
-//   STEP 0 就崩     -> 编译链/CRC/工具链层面问题，代码怎么改都没用
-//
-// 编译：把本目录整体作为 M= 目标，Makefile 里 obj-m += mp.o
-
+// mp.c — MYKC 最小装载验证模块 (v2)
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
@@ -25,20 +9,25 @@
 #include <linux/fs.h>
 #include <linux/kprobes.h>
 
+/* 字符串化：内核不提供 MP_STR，自己定义 */
+#define MP_XSTR(s) #s
+#define MP_STR(s)  MP_XSTR(s)
+
 #ifndef MP_STEP
 #define MP_STEP 0
 #endif
 
 #define MP_TAG "mp: "
 
-// 编译期固定字符串，便于 dmesg 里能确认版本一致
-static const char *mp_ver = "MP_BUILD_v1_STEP" MP_STR(MP_STEP);
+static const char *mp_ver = "MP_BUILD_v2_STEP" MP_STR(MP_STEP);
 
+#if MP_STEP >= 4
 static struct miscdevice mp_misc = {
 	.minor = MISC_DYNAMIC_MINOR,
 	.name  = "minprobe",
-	.fops  = NULL,   /* 不提供操作接口，纯占位 */
+	.fops  = NULL,
 };
+#endif
 
 #if MP_STEP >= 5
 static int mp_kprobe_pre(struct kprobe *p, struct pt_regs *regs)
@@ -64,7 +53,7 @@ static int __init mp_init(void)
 			pr_err(MP_TAG "vzalloc failed\n");
 			return -ENOMEM;
 		}
-		pr_info(MP_TAG "step1 vzalloc ok @ %px\n", p);
+		pr_info(MP_TAG "step1 vzalloc ok\n");
 		vfree(p);
 	}
 #endif
@@ -76,7 +65,7 @@ static int __init mp_init(void)
 			pr_err(MP_TAG "kzalloc failed\n");
 			return -ENOMEM;
 		}
-		pr_info(MP_TAG "step2 kzalloc ok @ %px\n", p);
+		pr_info(MP_TAG "step2 kzalloc ok\n");
 		kfree(p);
 	}
 #endif
@@ -110,7 +99,7 @@ static int __init mp_init(void)
 		pr_err(MP_TAG "step5 register_kprobe failed: %d\n", ret);
 		return ret;
 	}
-	pr_info(MP_TAG "step5 register_kprobe ok @ %px\n", mp_kp.addr);
+	pr_info(MP_TAG "step5 register_kprobe ok\n");
 	unregister_kprobe(&mp_kp);
 	pr_info(MP_TAG "step5 unregister_kprobe ok\n");
 #endif

@@ -135,7 +135,9 @@ jobs:
               CC=clang LD=ld.lld LLVM=1 \
               CLANG_TRIPLE=aarch64-linux-gnu- \
               MP_STEP=$STEP \
-              modules 2>&1 | tail -8
+              modules > mpbuild.log 2>&1 || true
+            echo "--- build log (last 40) ---"
+            tail -40 mpbuild.log
 
             if [ -f mp.ko ]; then
               cp mp.ko "../artifacts/mp_s${STEP}.ko"
