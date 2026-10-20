@@ -6,7 +6,7 @@
 # 方式 B: 用完整内核源码树
 
 obj-m += mykc_core.o
-mykc_core-objs := mykc_main.o mykc_esp.o mykc_cfi.o
+mykc_core-objs := mykc_main.o mykc_esp.o
 
 # ★★★ v16 诊断用: 最小加载探针 ★★★
 #   v15 在用户设备上 insmod 即重启, 需要逐层定位是 init 路径哪一步炸的。

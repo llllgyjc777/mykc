@@ -456,7 +456,7 @@ typedef unsigned long (*klookup_t)(const char *name);
 static klookup_t g_klookup;   /* 兼容保留: 用户态可经 ioctl 下发 */
 
 /* ★ A 路线 (2026-10-16): mykc_cfi.c 提供 —— CFI 严格模式绕过 */
-extern int  mykc_cfi_bypass(void);
+/* CFI bypass removed: build-side kCFI must handle it */
 extern void mykc_cfi_restore(void);
 
 /* 惰性 kprobe 解析: 用 register_kprobe 白嫖任意内核符号地址 */
@@ -806,9 +806,7 @@ static int __init mykc_init(void)
      *   不跑 LTO 链接, 符号根本不生成), 所以先 patch 掉失败处理器, 
      *   让校验失败变成"静默返回"。
      *   失败也不阻止加载 (非致命, 只是 CFI 场景可能崩)。 */
-    ret = mykc_cfi_bypass();
-    if (ret)
-        pr_warn("cfi bypass failed: %d (continuing anyway)\n", ret);
+    /* CFI bypass removed (panic source): rely on build-side kCFI typeid */
 
     g_pte_cache = vzalloc(sizeof(struct pte_cache_entry) * PTE_CACHE_SIZE);
     if (!g_pte_cache) return -ENOMEM;
