@@ -1,19 +1,25 @@
-/* mykc_core.c —— MyKernelCore 内核模块主体（原创）
+/* mykc_core.c -- MyKernelCore kernel module (v33)
  *
- * 目标内核: 6.6.118-android15-8-GKI (REDMI K80 Pro / SM8750)
+ * Target kernel: 6.6.118-android15-8-GKI (REDMI K80 Pro / SM8750)
  *
- * 组成:
- *   [A] 内存引擎   页表遍历 + PTE 哈希缓存
- *   [B] 批量引擎   一次 ioctl 读 64 个散地址
- *   [C] 共享环     mmap 零拷贝
- *   [D] 隐藏引擎   modules 链表摘除
- *   [E] 符号引擎   kallsyms_lookup_name
- *   [F] fd 注入
- *   [G] ioctl 总入口（含 v2: track/config/frame）
+ * ARCHITECTURE (v33): kernel is a PURE MEMORY PROVIDER.
+ *   The kernel does NOT know anything about the game, actors, coordinates,
+ *   cameras or projection. It only answers "read N bytes at this address".
+ *   All ESP logic (World->Level->Actors, W2S, drawing) lives in userspace.
  *
- * 与 mykc_esp.c 的分工:
- *   core 提供「能力」: mykc_read_mm / mykc_get_mm / mykc_put_mm
- *   esp  提供「引擎」: 自动追踪 + 内核态 W2S + 方框输出
+ * Components:
+ *   [A] Memory engine    page-table walk (no cache; every access re-translated)
+ *   [B] Batch engine     read 64 scattered addresses in one ioctl
+ *   [C] Shared ring      mmap zero-copy
+ *   [D] Hide engine      remove from modules list
+ *   [E] Symbol engine    kallsyms_lookup_name
+ *   [F] fd injection
+ *   [G] ioctl entry
+ *
+ * Removed in v33: in-kernel ESP engine (track/config/frame ioctls, timer, work).
+ * Rationale: the kernel-side timer walked page tables in interrupt context and
+ * could trip KCFI on a failed call -> BUG() -> reboot. Userspace already has
+ * everything it needs through READ/WRITE.
  */
 #define pr_fmt(fmt) "[mykc] " fmt
 
@@ -514,16 +520,7 @@ static int install_fd_to_pid(u32 pid, u64 *out_fd)
     return 0;
 }
 
-/* =====================================================================
- *  ESP 引擎对外接口（定义在 mykc_esp.c）
- * ===================================================================== */
-int  mykc_esp_init(void);
-void mykc_esp_exit(void);
-int  mykc_esp_track(struct mykc_track *tr);
-int  mykc_esp_config(struct mykc_espcfg *cfg);
-int  mykc_esp_get_frame(struct mykc_espframe *out);
-void mykc_esp_set_base(u64 base);
-int  mykc_esp_get_pid(void);
+/* v33: ESP engine removed - all coordinate/projection logic moved to userspace */
 
 /* =====================================================================
  *  [G] ioctl 总入口
@@ -632,7 +629,6 @@ static long mykc_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         md.base = found;
         if (copy_to_user(uarg, &md, sizeof(md))) return -EFAULT;
         /* 顺手把 base 告诉 ESP 引擎 */
-        if (found) mykc_esp_set_base(found);
         return found ? 0 : -ENOENT;
     }
 
@@ -687,29 +683,7 @@ static long mykc_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         if (copy_to_user(uarg, &g_info, sizeof(g_info))) return -EFAULT;
         break;
 
-    /* ---------- v2 引擎 ---------- */
-
-    case MYKC_IO_TRACK_PID: {
-        struct mykc_track tr;
-        if (copy_from_user(&tr, uarg, sizeof(tr))) return -EFAULT;
-        return mykc_esp_track(&tr);
-    }
-
-    case MYKC_IO_ESP_CONFIG: {
-        struct mykc_espcfg cfg;
-        if (copy_from_user(&cfg, uarg, sizeof(cfg))) return -EFAULT;
-        return mykc_esp_config(&cfg);
-    }
-
-    case MYKC_IO_ESP_FRAME: {
-        struct mykc_espframe *fr = kmalloc(sizeof(*fr), GFP_KERNEL);
-        if (!fr) return -ENOMEM;
-        mykc_esp_get_frame(fr);
-        if (copy_to_user(uarg, fr, sizeof(*fr))) { kfree(fr); return -EFAULT; }
-        kfree(fr);
-        break;
-    }
-
+    /* v33: TRACK_PID / ESP_CONFIG / ESP_FRAME removed (kernel no longer runs ESP) */
     default:
         return -ENOTTY;
     }
@@ -815,10 +789,7 @@ static int __init mykc_init(void)
         return ret;
     }
 
-    /* 启动 ESP 引擎 */
-    ret = mykc_esp_init();
-    if (ret)
-        pr_warn("esp init failed: %d (ESP disabled)\n", ret);
+    /* v33: 无 ESP 引擎，无需初始化 */
 
     pr_info("v%x loaded. /dev/%s ready (PTE cache %d)\n",
             MYKC_VERSION, MYKC_DEV_NAME, PTE_CACHE_SIZE);
@@ -837,7 +808,7 @@ static void __exit mykc_exit(void)
      *   CFI 失败就又会进 BUG() → 重启; 且 vfree(g_pte_cache) 时若 ESP
      *   work 还在读 pte_cache_lookup → use-after-free。
      */
-    mykc_esp_exit();
+    /* v33: 无 ESP 引擎，无需退出处理 */
 
     /* mykc_cfi_restore() removed: mykc_cfi.o no longer built */
 
