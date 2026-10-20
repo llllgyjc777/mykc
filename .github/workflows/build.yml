@@ -490,21 +490,6 @@ jobs:
           fi
           set +e
 
-          # ============================================================
-          # v26: 清空 __versions 段 —— 与 paradise 同款做法
-          #   实证: paradise 6.6 驱动 __versions sh_size = 0, insmod RC=0
-          #   我们的模块带 58 项 CRC 且有 19 项与设备不符 =>
-          #   "disagrees about version of symbol module_layout" => EINVAL
-          #   清空后内核 check_version() 直接返回 0, 不校验 CRC
-          # ============================================================
-          echo "=== v26: strip __versions ==="
-          for K in mykc_core.ko mykc_probe.ko; do
-            if [ -f "$K" ]; then
-              python3 "$GITHUB_WORKSPACE/strip_versions.py" "$K" || echo "  !! strip failed: $K"
-            fi
-          done
-          echo "---- 校验 ----"
-          readelf -SW mykc_core.ko 2>/dev/null | grep __versions || echo "  (no __versions)"
           echo "===== BUILD LOG SIZE ====="
           wc -l /tmp/build.log || true
           echo "===== ★ 真实 clang 命令行 (前 3 条完整行) ====="
@@ -537,11 +522,9 @@ jobs:
           echo "  (A 路线说明: 外部模块不跑 LTO 链接, typeid 可 == 0; 这不算失败)"
           CFI_SYM=$(readelf -sW mykc_core.ko 2>/dev/null | grep -c 'mykc_cfi' || true)
           echo "MYKC_CFI_SYMBOLS=$CFI_SYM"
-          if [ "$CFI_SYM" -lt 1 ]; then
-            echo "FAIL: mykc_cfi 未链接进模块 (A 路线核心缺失)"
-            exit 1
-          fi
-          echo "OK: mykc_cfi CFI-bypass 已链接 ($CFI_SYM 条符号)"
+          # v30: cfi_bypass 已整体移除(模块内 blr=0, kCFI 永不触发), 此断言过时
+          echo "  (v30: mykc_cfi 已弃用, 不做断言; 只要求 __versions 被剥除)"
+          echo "OK: 跳过 mykc_cfi 检查 ($CFI_SYM 条符号, 允许为 0)"
           echo "--- CFI 相关段/符号预览 ---"
           readelf -sW mykc_core.ko 2>/dev/null | grep -iE 'cfi' | head -10 || echo "(无 cfi 相关符号)"
           echo "--- UND 表里的 CFI 依赖 (应为空或仅 patch_text) ---"
@@ -575,13 +558,13 @@ jobs:
           #   v15 改为写**真实 CRC**: 先把设备官方模块的 __versions 表
           #   dump 成 crcs.txt (仓库里已带一份, 也可现场重新生成), 再逐符号填表。
           CRC_TABLE=$GITHUB_WORKSPACE/crcs.txt
-          if [ ! -s "$CRC_TABLE" ]; then
+          if false; then   # v29: crcs.txt 路线弃用, 改 strip __versions
             echo "!! crcs.txt 不存在或为空, 无法安全写 __versions"
             echo "   请在设备上执行: python3 crc_dump.py /vendor/lib/modules > crcs.txt"
             exit 1
           fi
           echo "crcs.txt 行数: $(wc -l < $CRC_TABLE)"
-          python3 $GITHUB_WORKSPACE/add_versions2.py mykc_core.ko --crc-table $CRC_TABLE
+          # v29 skipped: # v29 skipped: python3 $GITHUB_WORKSPACE/add_versions2.py mykc_core.ko --crc-table $CRC_TABLE   (改用 strip __versions, 不伪造 CRC)   (改用 strip __versions, 不伪造 CRC)
           readelf -SW mykc_core.ko | grep -E '__versions|Name' || true
 
           # 硬校验: 段必须存在且 size > 0 (size==0 就是 v14 的老问题)
@@ -619,22 +602,29 @@ jobs:
           fi
           echo "=== 最终尺寸 ==="; ls -la mykc_core.ko
 
-          echo "=== [4/4] 给 mykc_probe.ko 也写入真实 CRC ==="
-          python3 $GITHUB_WORKSPACE/add_versions2.py mykc_probe.ko --crc-table $CRC_TABLE
+          # ============ v29: 剥除 __versions (paradise 同款) ============
+          echo "=== v29: strip __versions ==="
+          for K in mykc_core.ko mykc_probe.ko; do
+            if [ -f "$K" ]; then
+              python3 "$GITHUB_WORKSPACE/strip_versions.py" "$K" || true
+              SZ=$(readelf -SW "$K" | awk '/__versions/ {print $6}' | head -1)
+              echo "  $K __versions size = [$SZ]"
+            fi
+          done
+          CORE_SZ=$(readelf -SW mykc_core.ko | awk '/__versions/ {print $6}' | head -1)
+          if [ -n "$CORE_SZ" ] && [ "$CORE_SZ" != "000000" ]; then
+            echo "FAIL: mykc_core.ko __versions 未剥除"; exit 1
+          fi
+          echo "OK: __versions 已剥除, 内核将跳过 CRC 校验"
+
+          
+          echo "=== [4/4] v30: probe __versions 已剥除校验 ==="
           PSZ=$(readelf -SW mykc_probe.ko | awk '/__versions/ {print $6}' | head -1)
-          echo "probe __versions size = $PSZ"
-          if [ -z "$PSZ" ] || [ "$PSZ" = "0" ]; then
-            echo "FAIL: mykc_probe.ko 的 __versions 为空"; exit 1
+          echo "probe __versions size = [$PSZ]"
+          if [ -n "$PSZ" ] && [ "$PSZ" != "000000" ]; then
+            echo "FAIL: mykc_probe.ko __versions 未剥除 ($PSZ)"; exit 1
           fi
-          if python3 $GITHUB_WORKSPACE/verify_crc.py mykc_probe.ko $CRC_TABLE > /tmp/crc_probe.txt 2>&1; then
-            echo "OK: mykc_probe.ko CRC 完全匹配"
-          else
-            echo "!! mykc_probe.ko CRC 未完全匹配 (不影响主模块)"
-            cat /tmp/crc_probe.txt || true
-            cp -f mykc_probe.ko mykc_probe_nov.ko
-            python3 $GITHUB_WORKSPACE/strip_versions.py mykc_probe_nov.ko || true
-            echo "已生成 mykc_probe_nov.ko 兜底"
-          fi
+          echo "OK: mykc_probe.ko __versions 已剥除, 跳过 CRC 校验"
           echo "OK: mykc_probe.ko 已就绪 ($(wc -c < mykc_probe.ko) bytes)"
 
       - name: 生成自释放脚本
