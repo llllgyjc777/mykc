@@ -291,14 +291,17 @@ jobs:
               echo 'CONFIG_KUNIT=m' >> .config
             fi
           fi
-          echo "=== v31 硬断言: CONFIG_KUNIT=m ==="
+          # v32-downgrade: v31 KUNIT 断言已降级
+          # 事实: v31 该断言通过了, 但产物 exit 仍是 0x5a8 => 该推断不成立。
+          # 原因: .config 文本出现 CONFIG_KUNIT=m 不等于 module.h 的
+          #       #if IS_ENABLED(CONFIG_KUNIT) 为真(其依赖 CONFIG_KUNIT_MODULE
+          #       等 kbuild 派生宏, 依赖不满足时会被静默降为 n)。
+          # 因此这里只做记录, 真正的判定交给后面 v32 对 .rela 的产物级断言。
+          echo "=== v31: CONFIG_KUNIT 状态 (仅记录) ==="
           if grep -q '^CONFIG_KUNIT=m' .config; then
-            echo "  OK: CONFIG_KUNIT=m 在位 => struct module 含 16 字节 kunit 字段"
+            echo "  .config 文本: CONFIG_KUNIT=m (不构成 struct module 布局保证)"
           else
-            echo "  !! 严重: CONFIG_KUNIT 无法设为 m"
-            echo "  !! struct module 将少 16 字节, 模块装载必崩"
-            grep -iE '^#? ?CONFIG_KUNIT' .config || echo "  (完全不存在)"
-            exit 1
+            echo "  .config 文本: 未启用 KUNIT (正常, 由 v32 产物修正兜底)"
           fi
           echo "=== v31: struct module 关键字段自检 (编译后验证用) ==="
           grep -E '^CONFIG_(MODULE_UNLOAD|KUNIT|LIVEPATCH|GENERIC_BUG|KALLSYMS)=' .config || true
@@ -667,6 +670,57 @@ jobs:
           fi
           echo "OK: mykc_probe.ko __versions 已剥除, 跳过 CRC 校验"
           echo "OK: mykc_probe.ko 已就绪 ($(wc -c < mykc_probe.ko) bytes)"
+
+          # ===== v32: struct module exit offset fix =====
+          # 设备内核 (6.6.118-android15-8, CONFIG_KUNIT=m) 的 struct module 含:
+          #   num_kunit_suites (1420) + kunit_suites (1424) = 16 字节
+          # => source_list=1432  target_list=1448(0x5a8)  exit=1464(0x5b8)
+          # 若产物按 exit=0x5a8 生成, 内核按 0x5b8 解读 => 字段整体错位 16 字节
+          # => mod_sysfs_setup+0x2c0 处 ldr x0,[x8,#0x108] 取到垃圾 => Oops。
+          # 铁证: /vendor/lib/modules/binder_prio.ko 与 ufs_ffu.ko 均 exit=0x5b8。
+          # 修正: .rela.gnu.linkonce.this_module 中 cleanup_module 的
+          #       r_offset 0x5a8 -> 0x5b8 (只改 8 字节偏移, 不动符号与 addend)。
+          echo "=== v32: 修正 struct module exit 偏移 ==="
+          echo "--- 修正前 ---"
+          for K in mykc_core.ko mykc_probe.ko; do
+            if [ -f "$K" ]; then
+              echo "  [$K]"
+              readelf -rW "$K" 2>/dev/null | grep -A3 'rela.gnu.linkonce.this_module' \
+                | grep -E 'R_AARCH64_ABS64' | sed 's/^/    /' || true
+            fi
+          done
+
+          FIX_RC=0
+          python3 "$GITHUB_WORKSPACE/fix_exit_off.py" mykc_core.ko mykc_probe.ko || FIX_RC=$?
+
+          echo "--- 修正后 ---"
+          for K in mykc_core.ko mykc_probe.ko; do
+            if [ -f "$K" ]; then
+              echo "  [$K]"
+              readelf -rW "$K" 2>/dev/null | grep -A3 'rela.gnu.linkonce.this_module' \
+                | grep -E 'R_AARCH64_ABS64' | sed 's/^/    /' || true
+            fi
+          done
+
+          # 产物级硬断言: init 必须 0x188, exit 必须 0x5b8
+          for K in mykc_core.ko mykc_probe.ko; do
+            if [ ! -f "$K" ]; then continue; fi
+            RELA=$(readelf -rW "$K" 2>/dev/null | grep -A3 'rela.gnu.linkonce.this_module')
+            IN=$(echo "$RELA" | grep 'init_module' | awk '{print $1}' | head -1)
+            EX=$(echo "$RELA" | grep 'cleanup_module' | awk '{print $1}' | head -1)
+            echo "  $K : init=$IN exit=$EX"
+            if [ "$IN" != "0000000000000188" ]; then
+              echo "FAIL: $K init_module r_offset 应为 0x188, 实际 [$IN]"; exit 1
+            fi
+            if [ "$EX" != "00000000000005b8" ]; then
+              echo "FAIL: $K cleanup_module r_offset 应为 0x5b8, 实际 [$EX]"; exit 1
+            fi
+          done
+          echo "OK: exit 偏移已对齐设备布局 (0x5b8)"
+          if [ "$FIX_RC" != "0" ]; then
+            echo "  (备注: fix_exit_off.py 返回 $FIX_RC, 但断言已通过)"
+          fi
+          # ===== end v32 =====
 
       - name: 生成自释放脚本
         run: |
