@@ -261,6 +261,47 @@ jobs:
           grep -E '^CONFIG_(KASAN|KASAN_HW_TAGS|KASAN_VMALLOC|KFENCE)=' .config || true
           echo "=== olddefconfig ==="
           make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -5
+          # ============================================================
+          # ★ v31 核心: 强制恢复 CONFIG_KUNIT=m
+          #   根因: struct module 里 num_kunit_suites / kunit_suites 由
+          #         #if IS_ENABLED(CONFIG_KUNIT) 控制, 共 16 字节。
+          #         设备内核 KUNIT=m => 有这 16 字节 => exit 在 1464。
+          #         若 olddefconfig 关掉 KUNIT => 少 16 字节 => exit 在 1448。
+          #         内核按设备布局读 => mod_sysfs_setup 读到垃圾 => Oops 重启。
+          # ============================================================
+          echo "=== v31: 强制写入 CONFIG_KUNIT=m ==="
+          if grep -q '^CONFIG_KUNIT=' .config; then
+            sed -i 's/^CONFIG_KUNIT=.*/CONFIG_KUNIT=m/' .config
+          elif grep -q '^# CONFIG_KUNIT is not set' .config; then
+            sed -i 's/^# CONFIG_KUNIT is not set/CONFIG_KUNIT=m/' .config
+          else
+            echo 'CONFIG_KUNIT=m' >> .config
+          fi
+          # 顺便确保依赖项在位 (KUNIT 依赖这些)
+          ./scripts/config --file .config -m KUNIT 2>/dev/null || true
+          ./scripts/config --file .config -e KUNIT_DEBUGFS 2>/dev/null || true
+          ./scripts/config --file .config -e HAVE_ARCH_KUNIT 2>/dev/null || true
+          echo "=== v31: 二次 olddefconfig (让依赖自洽) ==="
+          make ARCH=arm64 CC=$CLANG LLVM=1 olddefconfig 2>&1 | tail -3
+          # 二次 olddefconfig 可能又把它关掉, 所以再写一次
+          if ! grep -q '^CONFIG_KUNIT=m' .config; then
+            echo "  !! 二次 olddefconfig 后 KUNIT 丢失, 再写一次"
+            sed -i 's/^# CONFIG_KUNIT is not set/CONFIG_KUNIT=m/' .config
+            if ! grep -q '^CONFIG_KUNIT=m' .config; then
+              echo 'CONFIG_KUNIT=m' >> .config
+            fi
+          fi
+          echo "=== v31 硬断言: CONFIG_KUNIT=m ==="
+          if grep -q '^CONFIG_KUNIT=m' .config; then
+            echo "  OK: CONFIG_KUNIT=m 在位 => struct module 含 16 字节 kunit 字段"
+          else
+            echo "  !! 严重: CONFIG_KUNIT 无法设为 m"
+            echo "  !! struct module 将少 16 字节, 模块装载必崩"
+            grep -iE '^#? ?CONFIG_KUNIT' .config || echo "  (完全不存在)"
+            exit 1
+          fi
+          echo "=== v31: struct module 关键字段自检 (编译后验证用) ==="
+          grep -E '^CONFIG_(MODULE_UNLOAD|KUNIT|LIVEPATCH|GENERIC_BUG|KALLSYMS)=' .config || true
           echo "=== olddefconfig 后 KASAN 状态 ==="
           grep -E '^CONFIG_(KASAN|KASAN_HW_TAGS|KASAN_VMALLOC|KFENCE)=' .config || true
           echo "=== .config 关键项自检 ==="
