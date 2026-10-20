@@ -94,20 +94,11 @@ static inline u32 pte_hash(u64 mm, u64 vaddr)
 
 static int pte_cache_lookup(u64 mm, u64 vaddr, u64 *paddr)
 {
-    u32 h = pte_hash(mm, vaddr);
-    struct pte_cache_entry *e;
-    int hit = 0;
-
-    spin_lock(&g_pte_lock);
-    e = &g_pte_cache[h];
-    if (e->mm == mm && e->vaddr == vaddr && e->paddr) {
-        *paddr = e->paddr;
-        e->stamp = jiffies;
-        g_info.pte_cache_hits++;
-        hit = 1;
-    }
-    spin_unlock(&g_pte_lock);
-    return hit;
+    /* v33: PTE 缓存已停用。
+     * 原实现以「页地址」为 key 缓存 pa, 页面被 remap/换出后会返回过期 pa,
+     * 导致读到错误数据却无任何错误回报。现强制 miss, 每次走真实页表翻译。 */
+    (void)mm; (void)vaddr; (void)paddr;
+    return 0;
 }
 
 static void pte_cache_store(u64 mm, u64 vaddr, u64 paddr)
@@ -194,7 +185,6 @@ static u64 virt_to_phys_in_mm(struct mm_struct *mm, u64 vaddr)
 int mykc_read_mm(struct mm_struct *mm, u64 vaddr, void *dst, size_t len)
 {
     u64 paddr;
-    void *map;
     size_t done = 0;
 
     while (done < len) {
@@ -202,15 +192,14 @@ int mykc_read_mm(struct mm_struct *mm, u64 vaddr, void *dst, size_t len)
         u64 page_off = cur & ~PAGE_MASK;
         size_t chunk = min(len - done, PAGE_SIZE - page_off);
 
-        if (!pte_cache_lookup((u64)mm, cur & PAGE_MASK, &paddr)) {
-            paddr = virt_to_phys_in_mm(mm, cur);
-            if (!paddr) return -EFAULT;
-            pte_cache_store((u64)mm, cur & PAGE_MASK, paddr);
-        }
+        /* 每次重新翻译, 不信任任何缓存 (页可能被 remap/换出) */
+        paddr = virt_to_phys_in_mm(mm, cur);
+        if (!paddr) return -EFAULT;
 
-        map = phys_to_virt(paddr & PAGE_MASK);
-        if (!map) return -EFAULT;
-        memcpy((char *)dst + done, (char *)map + (paddr & ~PAGE_MASK), chunk);
+        /* KEY FIX: 页内偏移必须用 vaddr 的 page_off, 不是 paddr 的 */
+        memcpy((char *)dst + done,
+               (char *)phys_to_virt(paddr & PAGE_MASK) + page_off,
+               chunk);
         done += chunk;
     }
     g_info.reads++;
@@ -221,7 +210,6 @@ int mykc_read_mm(struct mm_struct *mm, u64 vaddr, void *dst, size_t len)
 static int write_virt(struct mm_struct *mm, u64 vaddr, const void *src, size_t len)
 {
     u64 paddr;
-    void *map;
     size_t done = 0;
 
     while (done < len) {
@@ -229,15 +217,12 @@ static int write_virt(struct mm_struct *mm, u64 vaddr, const void *src, size_t l
         u64 page_off = cur & ~PAGE_MASK;
         size_t chunk = min(len - done, PAGE_SIZE - page_off);
 
-        if (!pte_cache_lookup((u64)mm, cur & PAGE_MASK, &paddr)) {
-            paddr = virt_to_phys_in_mm(mm, cur);
-            if (!paddr) return -EFAULT;
-            pte_cache_store((u64)mm, cur & PAGE_MASK, paddr);
-        }
+        paddr = virt_to_phys_in_mm(mm, cur);
+        if (!paddr) return -EFAULT;
 
-        map = phys_to_virt(paddr & PAGE_MASK);
-        if (!map) return -EFAULT;
-        memcpy((char *)map + (paddr & ~PAGE_MASK), (const char *)src + done, chunk);
+        /* KEY FIX: 同读路径, 页内偏移用 vaddr 的 page_off */
+        memcpy((char *)phys_to_virt(paddr & PAGE_MASK) + page_off,
+               (const char *)src + done, chunk);
         done += chunk;
     }
     g_info.writes++;
