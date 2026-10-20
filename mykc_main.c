@@ -854,7 +854,7 @@ static void __exit mykc_exit(void)
      */
     mykc_esp_exit();
 
-    mykc_cfi_restore();
+    /* mykc_cfi_restore() removed: mykc_cfi.o no longer built */
 
     /* ★ v4: 若 S3 隐身已注销 misc 设备, 此处不可重复注销（否则 double-free） */
     if (g_stealth < MYKC_STEALTH_FULL)

@@ -490,6 +490,21 @@ jobs:
           fi
           set +e
 
+          # ============================================================
+          # v26: 清空 __versions 段 —— 与 paradise 同款做法
+          #   实证: paradise 6.6 驱动 __versions sh_size = 0, insmod RC=0
+          #   我们的模块带 58 项 CRC 且有 19 项与设备不符 =>
+          #   "disagrees about version of symbol module_layout" => EINVAL
+          #   清空后内核 check_version() 直接返回 0, 不校验 CRC
+          # ============================================================
+          echo "=== v26: strip __versions ==="
+          for K in mykc_core.ko mykc_probe.ko; do
+            if [ -f "$K" ]; then
+              python3 "$GITHUB_WORKSPACE/strip_versions.py" "$K" || echo "  !! strip failed: $K"
+            fi
+          done
+          echo "---- 校验 ----"
+          readelf -SW mykc_core.ko 2>/dev/null | grep __versions || echo "  (no __versions)"
           echo "===== BUILD LOG SIZE ====="
           wc -l /tmp/build.log || true
           echo "===== ★ 真实 clang 命令行 (前 3 条完整行) ====="
