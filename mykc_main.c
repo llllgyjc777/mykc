@@ -5,7 +5,7 @@
  * ARCHITECTURE (v33): kernel is a PURE MEMORY PROVIDER.
  *   The kernel does NOT know anything about the game, actors, coordinates,
  *   cameras or projection. It only answers "read N bytes at this address".
- *   All ESP logic (World->Level->Actors, W2S, drawing) lives in userspace.
+ *   All game-side logic (World->Level->Actors, W2S, drawing) lives in userspace.
  *
  * Components:
  *   [A] Memory engine    page-table walk (no cache; every access re-translated)
@@ -16,7 +16,8 @@
  *   [F] fd injection
  *   [G] ioctl entry
  *
- * Removed in v33: in-kernel ESP engine (track/config/frame ioctls, timer, work).
+ * Removed in v33: in-kernel game logic (track/config/frame ioctls, timer, work).
+ * v34: symbol hiding (kallsyms) + taint clearing + cleaner interface.
  * Rationale: the kernel-side timer walked page tables in interrupt context and
  * could trip KCFI on a failed call -> BUG() -> reboot. Userspace already has
  * everything it needs through READ/WRITE.
@@ -187,7 +188,7 @@ static u64 virt_to_phys_in_mm(struct mm_struct *mm, u64 vaddr)
     return paddr;
 }
 
-/* ---- 虚拟内存读（导出，供 esp 复用）---- */
+/* ---- 虚拟内存读（核心原语）---- */
 int mykc_read_mm(struct mm_struct *mm, u64 vaddr, void *dst, size_t len)
 {
     u64 paddr;
@@ -292,7 +293,24 @@ static int write_phys_addr(u64 paddr, const void *src, size_t len)
     return 0;
 }
 
-/* ---- 按 pid 拿 mm（导出，供 esp 复用）---- */
+/* ---- v34: 按 comm 名字查 pid ---- */
+static u32 find_pid_by_comm(const char *want)
+{
+    struct task_struct *t;
+    u32 found = 0;
+    if (!want || !want[0]) return 0;
+    rcu_read_lock();
+    for_each_process(t) {
+        if (t->comm[0] && strstr(t->comm, want)) {
+            found = t->pid;
+            break;
+        }
+    }
+    rcu_read_unlock();
+    return found;
+}
+
+/* ---- 按 pid 拿 mm（核心原语）---- */
 struct mm_struct *mykc_get_mm(u32 pid, struct task_struct **out)
 {
     struct task_struct *task;
@@ -520,7 +538,7 @@ static int install_fd_to_pid(u32 pid, u64 *out_fd)
     return 0;
 }
 
-/* v33: ESP engine removed - all coordinate/projection logic moved to userspace */
+/* v33/v34: 内核不持有任何游戏语义，仅通用内存原语 */
 
 /* =====================================================================
  *  [G] ioctl 总入口
@@ -628,7 +646,6 @@ static long mykc_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
 
         md.base = found;
         if (copy_to_user(uarg, &md, sizeof(md))) return -EFAULT;
-        /* 顺手把 base 告诉 ESP 引擎 */
         return found ? 0 : -ENOENT;
     }
 
@@ -667,6 +684,19 @@ static long mykc_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         return mykc_stealth((u32)lv);
     }
 
+    /* v34: 按名字查进程 */
+    case MYKC_IO_FIND_PROC: {
+        struct mykc_findproc fp;
+        u32 pid;
+        if (copy_from_user(&fp, uarg, sizeof(fp))) return -EFAULT;
+        fp.name[sizeof(fp.name) - 1] = 0;
+        pid = find_pid_by_comm(fp.name);
+        if (!pid) return -ESRCH;
+        fp.out_pid = pid;
+        if (copy_to_user(uarg, &fp, sizeof(fp))) return -EFAULT;
+        return 0;
+    }
+
     case MYKC_IO_SETFLAGS: {
         unsigned long fl;
         if (copy_from_user(&fl, uarg, sizeof(fl))) return -EFAULT;
@@ -683,7 +713,7 @@ static long mykc_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
         if (copy_to_user(uarg, &g_info, sizeof(g_info))) return -EFAULT;
         break;
 
-    /* v33: TRACK_PID / ESP_CONFIG / ESP_FRAME removed (kernel no longer runs ESP) */
+    
     default:
         return -ENOTTY;
     }
@@ -696,6 +726,11 @@ static const struct file_operations mykc_fops = {
     .mmap           = mykc_ring_mmap,
     .llseek         = no_llseek,
 };
+
+/* ---- v34: 模块参数, 加载即隐身 ---- */
+static unsigned int g_auto_stealth = 0;
+module_param_named(stealth, g_auto_stealth, uint, 0644);
+MODULE_PARM_DESC(stealth, "Auto stealth level at load: 0=off 1=lsmod 2=+sysfs 3=+misc");
 
 static struct miscdevice mykc_dev = {
     .minor = MISC_DYNAMIC_MINOR,
@@ -751,6 +786,17 @@ static int mykc_stealth(u32 level)
     return 0;
 }
 
+/* ---- v34: 延时隐身 workqueue ---- */
+static void mykc_stealth_work_fn(struct work_struct *w)
+{
+    if (g_auto_stealth >= MYKC_STEALTH_FULL)
+        mykc_stealth(MYKC_STEALTH_FULL);
+    else
+        mykc_stealth(g_auto_stealth);
+    pr_info("auto stealth applied, level=%u\n", g_stealth);
+}
+static DECLARE_DELAYED_WORK(g_stealth_work, mykc_stealth_work_fn);
+
 /* =====================================================================
  *  初始化 / 卸载
  * ===================================================================== */
@@ -789,7 +835,22 @@ static int __init mykc_init(void)
         return ret;
     }
 
-    /* v33: 无 ESP 引擎，无需初始化 */
+    /* v34: 纯内存提供者，无额外子系统需初始化 */
+
+    {
+        /* v34 自动隐身:
+         *   stealth=1     -> 立即摘模块链
+         *   stealth=2/3   -> 延时 2 秒（给用户态 open 机会），之后升到对应级别
+         */
+        if (g_auto_stealth >= MYKC_STEALTH_LIST) {
+            mykc_stealth(MYKC_STEALTH_LIST);
+            pr_info("auto stealth S1 applied at load\n");
+        }
+        if (g_auto_stealth >= MYKC_STEALTH_SYSFS) {
+            schedule_delayed_work(&g_stealth_work, msecs_to_jiffies(2000));
+            pr_info("auto stealth S%u scheduled in 2s\n", g_auto_stealth);
+        }
+    }
 
     pr_info("v%x loaded. /dev/%s ready (PTE cache %d)\n",
             MYKC_VERSION, MYKC_DEV_NAME, PTE_CACHE_SIZE);
@@ -798,17 +859,15 @@ static int __init mykc_init(void)
 
 static void __exit mykc_exit(void)
 {
-    /* ★★★ v15: 顺序很重要 ★★★
-     *   1) 先停 ESP (内部会清 enable / 停 timer / 停 work), 保证没有
-     *      后台线程还在跑 mykc_read_mm;
-     *   2) 恢复 CFI 原指令;
-     *   3) 注销设备;
-     *   4) 最后才释放 g_pte_cache 等共享资源。
-     *   v14 把 cfi_restore 放第一步, 此时 ESP 定时器还在跑, 若期间发生
-     *   CFI 失败就又会进 BUG() → 重启; 且 vfree(g_pte_cache) 时若 ESP
-     *   work 还在读 pte_cache_lookup → use-after-free。
+    /* v34 退出顺序:
+     *   1) 恢复 CFI（若曾 patch）：越早越好，防止后续调用触发 CFI 失败
+     *   2) 注销 misc 设备（若 stealth 未到 S3，否则会二次销毁）
+     *   3) 释放符号隐藏记录 / pte cache / hide_pid 位图
+     *   4) 若 stealth 已摘模块链，不再重复操作
      */
-    /* v33: 无 ESP 引擎，无需退出处理 */
+    /* v34: 纯内存提供者，无额外子系统需清理 */
+
+    cancel_delayed_work_sync(&g_stealth_work);
 
     /* mykc_cfi_restore() removed: mykc_cfi.o no longer built */
 

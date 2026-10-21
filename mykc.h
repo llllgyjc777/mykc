@@ -4,8 +4,7 @@
  *   1. 页表遍历缓存 PTE-Cache    → 重复读同一页命中缓存，省 2 次页表走查
  *   2. 批量读 batch_read         → 一次 ioctl 读多个散地址，省 syscall 开销
  *   3. mmap 共享环 ring buffer   → 零拷贝，App 直接读映射内存，不走 ioctl
- *   4. 内核态 ESP 引擎           → 内核算完 W2S，直接吐"屏幕方框"
- *   5. 自动追踪进程              → 内核自己认领游戏，App 免传 PID
+ * *   5. 自动追踪进程              → 内核自己认领游戏，App 免传 PID
  */
 #ifndef _MYKC_H
 #define _MYKC_H
@@ -14,7 +13,7 @@
 
 #define MYKC_MAGIC        0x4d4b4301u   /* "MKC\1" */
 #define MYKC_DEV_NAME     "mykc"
-#define MYKC_VERSION      0x0200        /* 2.0: +记住进程 +内核ESP */
+#define MYKC_VERSION      0x0300        /* 3.0: 纯内存原语 + 隐蔽 */
 
 /* =====================================================================
  *  结构体定义（必须在 ioctl 宏之前）
@@ -60,6 +59,13 @@ struct mykc_sym {
     char   name[64];        /* 输入：符号名 */
 };
 
+/* ---------- v34: 按名字查进程 ---------- */
+struct mykc_findproc {
+    char  name[64];      /* 输入：comm 名字片段，如 "pubgmhd" */
+    __u32 out_pid;       /* 输出：找到的 pid，0 = 未找到 */
+    __u32 _pad;
+};
+
 /* ---------- fd 注入 ---------- */
 struct mykc_fd {
     __u32  pid;
@@ -77,27 +83,8 @@ struct mykc_info {
     __u64  writes;
     __u64  kernel_text;
 };
-
-/* ---------- v2: 追踪进程 ---------- */
-struct mykc_track {
-    __u32  pid;             /* 0 = 清空追踪 */
-    __u32  flags;           /* MYKC_TRK_* */
-    char   pkg[64];         /* 包名，用于自动认领 */
-};
 #define MYKC_TRK_PIN        0x0001   /* 固定追踪 */
 #define MYKC_TRK_AUTO       0x0002   /* 自动认领 */
-
-/* ---------- v2: ESP 配置 ---------- */
-struct mykc_espcfg {
-    __u32  enable;          /* 1=启动内核 ESP 引擎 */
-    __u32  interval_ms;     /* 扫描间隔 ms，默认 8 */
-    __u32  screen_w;
-    __u32  screen_h;
-    __u32  max_dist;        /* 最大显示距离(米)，0=不限 */
-    __u32  team_check;      /* 1=过滤队友 */
-    __u64  gworld_off;      /* GWorld 偏移，默认 0x1771CC38 */
-    __u64  fov;
-};
 
 /* ---------- v2: 方框 ---------- */
 /* ★ 内核禁浮点: 全部用 s32。坐标=像素; dist=米; hp=值×100 */
@@ -110,16 +97,6 @@ struct mykc_box {
 };
 #define MYKC_BOX_VISIBLE    0x0001
 #define MYKC_BOX_CACHED     0x0002
-
-/* ---------- v2: 一帧结果 ---------- */
-struct mykc_espframe {
-    __u32  count;           /* 有效方框数 */
-    __u32  seq;             /* 帧序号 */
-    __u64  ts_ns;           /* 时间戳 */
-    __u32  game_pid;        /* 当前追踪的游戏 pid */
-    __u32  _pad;
-    struct mykc_box boxes[MYKC_BOX_MAX];
-};
 
 /* =====================================================================
  *  ioctl 命令（结构体之后定义，避免未声明）
@@ -134,11 +111,10 @@ struct mykc_espframe {
 #define MYKC_IO_HIDE_MODULE   _IOW(MYKC_MAGIC,  8,  int)
 #define MYKC_IO_SETFLAGS      _IOW(MYKC_MAGIC,  9,  unsigned long)
 #define MYKC_IO_GET_INFO      _IOR(MYKC_MAGIC,  10, struct mykc_info)
-#define MYKC_IO_TRACK_PID     _IOW(MYKC_MAGIC,  11, struct mykc_track)
-#define MYKC_IO_ESP_CONFIG    _IOW(MYKC_MAGIC,  12, struct mykc_espcfg)
-#define MYKC_IO_ESP_FRAME     _IOR(MYKC_MAGIC,  13, struct mykc_espframe)
 /* ★ v4: 隐身模式（S1 摘 lsmod / S2 摘 sysfs / S3 焊死 /proc/devices 入口） */
 #define MYKC_IO_STEALTH       _IOW(MYKC_MAGIC,  14, unsigned long)
+/* v34: 按名字查进程 */
+#define MYKC_IO_FIND_PROC     _IOWR(MYKC_MAGIC, 15, struct mykc_findproc)
 
 /* 隐身等级（数字越大越隐蔽；0=全公开，调试用） */
 #define MYKC_STEALTH_NONE     0u  /* 全公开 */
